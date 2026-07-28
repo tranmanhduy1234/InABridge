@@ -1,38 +1,55 @@
 """
-debug_encoder.py
-Chạy: python debug_encoder.py
-Yêu cầu: pip install torch transformers
+imageEncoder_debug.py
+Bộ kiểm thử & Debug tự động cho ImageEncoder2 (DINOv2 / DINOv3).
+
+Cách chạy:
+    python /home/tranmanhduy/Workspace/chuyen_nganh/InA-Bridge/src/component/ImageEncoder2/imageEncoder_debug.py
+
+Yêu cầu:
+    pip install torch transformers
 """
 
+import os
 import sys
-import torch
 import traceback
-from src.component.ImageEncoder.imageEncoder import ImageEncoder, TrainMode
+import argparse
+import torch
+
+# Tự động thêm Project Root vào sys.path để hỗ trợ import module 'src' chính xác
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "../../.."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.component.ImageEncoder2.imageEncoder import ImageEncoder, TrainMode
 
 # ------------------------------------------------------------------
-# Config
+# Cấu hình Mặc định (Default Configurations)
 # ------------------------------------------------------------------
-MODEL_ID = "facebook/dinov2-large"   # Đổi thành model bạn dùng
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH    = 2
-IMG_SIZE = 448
-LOG_FILE = "/home/tranmanhduy/Workspace/chuyen_nganh/InA-Bridge/src/component/ImageEncoder/imageEncoder_debug.log"  # Tên file xuất log mặc định
+# Mặc định dùng "facebook/dinov2-large" (~304M params) công khai (un-gated).
+# Đối với DINOv3 300M (facebook/dinov3-vitl16-pretrain-lvd1689m - gated repo),
+# truyền qua CLI option --model_id sau khi đã đăng nhập HuggingFace Token.
+DEFAULT_MODEL_ID = "facebook/dinov2-large"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 2
+IMG_SIZE = 448  # Phải chia hết cho patch_size (14 đối với dinov2-large -> 448/14 = 32)
+LOG_FILE = os.path.join(CURRENT_DIR, "imageEncoder_debug.log")
 
-# Dummy input
-def make_input():
-    return torch.randn(BATCH, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
+
+def make_input(batch: int = BATCH_SIZE, img_size: int = IMG_SIZE, device: str = DEVICE) -> torch.Tensor:
+    """Tạo dummy input tensor cho testing."""
+    return torch.randn(batch, 3, img_size, img_size, device=device)
 
 
 # ------------------------------------------------------------------
-# Bộ điều hướng luồng (Tee Logger) — Tự động ghi song song Console + File
+# Logger song song (Console + Log File)
 # ------------------------------------------------------------------
-class DecoderLogger:
-    def __init__(self, filename):
+class DualLogger:
+    def __init__(self, filename: str):
         self.terminal = sys.stdout
-        # Ép định dạng utf-8 để hiển thị chuẩn emoji ✅ ❌ ⚠️ trên mọi hệ điều hành
         self.log = open(filename, "w", encoding="utf-8")
 
-    def write(self, message):
+    def write(self, message: str):
         self.terminal.write(message)
         self.log.write(message)
 
@@ -45,72 +62,84 @@ class DecoderLogger:
 
 
 # ------------------------------------------------------------------
-# Helpers
+# Formatting & Output Helpers
 # ------------------------------------------------------------------
-SEP  = "=" * 70
+SEP = "=" * 70
 SEP2 = "-" * 70
+
 
 def section(title: str):
     print(f"\n{SEP}")
     print(f"  {title}")
     print(SEP)
 
-def ok(msg):  print(f"  ✅  {msg}")
-def fail(msg): print(f"  ❌  {msg}")
-def warn(msg): print(f"  ⚠️   {msg}")
+
+def ok(msg: str):
+    print(f"  ✅  {msg}")
+
+
+def fail(msg: str):
+    print(f"  ❌  {msg}")
+
+
+def warn(msg: str):
+    print(f"  ⚠️   {msg}")
 
 
 # ------------------------------------------------------------------
-# Test 1 — Khởi tạo cơ bản
+# Test Cases
 # ------------------------------------------------------------------
-def test_init():
-    section("TEST 1 — Khởi tạo cơ bản")
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
+
+def test_init(model_id: str) -> ImageEncoder:
+    section("TEST 1 — Khởi tạo mô hình & Kiểm tra Thuộc tính")
+    enc = ImageEncoder(model_id).to(DEVICE)
+
+    ok(f"Khởi tạo thành công model: {model_id}")
+    ok(f"Device      : {enc.device}")
+    ok(f"Dtype       : {enc.dtype}")
+    ok(f"Embed dim   : {enc.embed_dim}")
+    ok(f"Patch size  : {enc.patch_size}")
+    ok(f"Register tok: {enc.num_register_tokens}")
     enc.summary()
-    ok("Khởi tạo thành công")
     return enc
 
-# ------------------------------------------------------------------
-# Test 2 — Validate return_layer (âm, dương, out-of-range)
-# ------------------------------------------------------------------
-def test_return_layer():
-    section("TEST 2 — Validate return_layer")
+
+def test_return_layer(model_id: str):
+    section("TEST 2 — Kiểm toán & Validating return_layer")
 
     cases = [
-        (-2,   True,  "index âm hợp lệ"),
-        (-1,   True,  "index âm = last layer"),
-        (0,    True,  "index 0 = embedding layer"),
-        (3,    True,  "index dương hợp lệ"),
-        (-999, False, "index âm out-of-range"),
-        (999,  False, "index dương out-of-range"),
+        (-2, True, "Index âm hợp lệ (kế cuối)"),
+        (-1, True, "Index âm hợp lệ (layer cuối)"),
+        (0, True, "Index 0 (embedding layer)"),
+        (3, True, "Index dương hợp lệ"),
+        (-999, False, "Index âm vượt giới hạn out-of-range"),
+        (999, False, "Index dương vượt giới hạn out-of-range"),
     ]
 
     for idx, should_pass, desc in cases:
         try:
-            enc = ImageEncoder(MODEL_ID, return_layer=idx)
+            enc = ImageEncoder(model_id, return_layer=idx)
             if should_pass:
                 ok(f"return_layer={idx:>5}  →  normalized={enc.return_layer}  ({desc})")
             else:
                 fail(f"return_layer={idx:>5}  lẽ ra phải raise ValueError  ({desc})")
         except (ValueError, IndexError) as e:
             if not should_pass:
-                ok(f"return_layer={idx:>5}  bị chặn đúng: {e}")
+                ok(f"return_layer={idx:>5}  bị chặn chính xác: {e}")
             else:
-                fail(f"return_layer={idx:>5}  raise không mong muốn: {e}")
+                fail(f"return_layer={idx:>5}  raise ngoài dự kiến: {e}")
 
-# ------------------------------------------------------------------
-# Test 3 — Tất cả TrainMode
-# ------------------------------------------------------------------
-def test_train_modes():
-    section("TEST 3 — TrainMode: FROZEN / PARTIAL / FULL")
 
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
+def test_train_modes(model_id: str):
+    section("TEST 3 — Các chế độ Huấn luyện TrainMode (FROZEN / PARTIAL / FULL)")
+
+    enc = ImageEncoder(model_id).to(DEVICE)
 
     for mode, ratio, expect_trainable in [
-        (TrainMode.FROZEN,  0.2,  False),
+        (TrainMode.FROZEN, 0.2, False),
         (TrainMode.PARTIAL, 0.25, True),
-        (TrainMode.PARTIAL, 0.5,  True),
-        (TrainMode.FULL,    0.2,  True),
+        (TrainMode.PARTIAL, 0.5, True),
+        (TrainMode.FULL, 0.2, True),
     ]:
         enc.set_train_mode(mode, ratio=ratio)
         tp = enc.trainable_parameters
@@ -120,10 +149,10 @@ def test_train_modes():
         status = ok if has_trainable == expect_trainable else fail
         status(
             f"mode={mode.value:<8}  ratio={ratio:.2f}  "
-            f"trainable={tp:>10,}  ({tr:.2%})"
+            f"trainable={tp:>10,} params  ({tr:.2%})"
         )
 
-    # Edge case: ratio = 0 hoặc 1 phải raise
+    # Edge cases: tỉ lệ ratio không hợp lệ cho PARTIAL
     print()
     for bad_ratio in [0.0, 1.0, -0.1, 1.5]:
         try:
@@ -133,185 +162,231 @@ def test_train_modes():
             ok(f"ratio={bad_ratio} bị chặn đúng: {e}")
 
 
-# ------------------------------------------------------------------
-# Test 4 — Forward pass + debug_forward
-# ------------------------------------------------------------------
-def test_forward():
-    section("TEST 4 — Forward pass")
+def test_token_geometry(model_id: str):
+    section("TEST 4 — Hình học Token & Strip Special Tokens (DINOv2 / DINOv3)")
 
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
-    x   = make_input()
+    enc = ImageEncoder(model_id).to(DEVICE)
 
-    # debug_forward in đầy đủ hidden states
-    feats = enc.debug_forward(x, verbose=True)
-    ok(f"debug_forward OK  →  feats.shape={list(feats.shape)}")
+    img_size = IMG_SIZE
+    if img_size % enc.patch_size != 0:
+        img_size = enc.patch_size * 16  # Chuẩn hoá kích thước ảnh chia hết cho patch_size
 
-    # forward thông thường
-    feats2 = enc(x)
-    assert feats.shape == feats2.shape, "Shape không khớp giữa debug_forward và forward!"
-    ok(f"forward OK  →  feats.shape={list(feats2.shape)}")
+    grid = enc.compute_grid_size(img_size)
+    num_patches = enc.compute_num_patches(img_size)
+    total_raw = enc.compute_total_tokens(img_size)
 
-    # Kiểm tra dtype và device
-    assert feats2.device.type == DEVICE.split(":")[0], "Device mismatch!"
-    ok(f"Device OK: {feats2.device}")
-    ok(f"Dtype : {feats2.dtype}")
+    ok(f"image_size={img_size} → grid={grid}x{grid} | patches={num_patches} | raw_tokens={total_raw}")
 
-# ------------------------------------------------------------------
-# Test 5 — Gradient flow (backward pass) - BẢN CẬP NHẬT CHÍNH XÁC
-# ------------------------------------------------------------------
-def test_grad_flow():
-    section("TEST 5 — Gradient flow (Computational Graph Verification)")
+    # Test resolution KHÔNG chia hết cho patch_size -> phải raise
+    invalid_size = img_size + 1
+    try:
+        enc.compute_num_patches(invalid_size)
+        fail(f"image_size={invalid_size} lẽ ra phải raise ValueError")
+    except ValueError as e:
+        ok(f"image_size={invalid_size} (không chia hết cho patch_size={enc.patch_size}) bị chặn chính xác: {e}")
 
-    # Khởi tạo encoder lên Device
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
-    
-    # Thiết lập chế độ PARTIAL để kiểm tra luồng gradient hỗn hợp
+    # Kiểm tra strip_special_tokens với tensor giả lập
+    dummy_raw = torch.randn(1, total_raw, enc.embed_dim, device=DEVICE)
+    stripped = enc.strip_special_tokens(dummy_raw, drop_cls=True)
+    assert stripped.shape[1] == num_patches, f"strip_special_tokens sai: got {stripped.shape[1]}, expected {num_patches}"
+    ok(f"strip_special_tokens(drop_cls=True)  → shape: {list(stripped.shape)} (chỉ giữ patch tokens)")
+
+    stripped_cls = enc.strip_special_tokens(dummy_raw, drop_cls=False)
+    assert stripped_cls.shape[1] == num_patches + 1, "strip_special_tokens(drop_cls=False) sai"
+    ok(f"strip_special_tokens(drop_cls=False) → shape: {list(stripped_cls.shape)} (CLS + patch tokens)")
+
+
+def test_forward(model_id: str):
+    section("TEST 5 — Forward Pass & Debug Forward")
+
+    enc = ImageEncoder(model_id).to(DEVICE)
+    img_size = IMG_SIZE
+    if img_size % enc.patch_size != 0:
+        img_size = enc.patch_size * 16
+
+    x = make_input(batch=BATCH_SIZE, img_size=img_size)
+
+    # 1. debug_forward
+    feats_debug = enc.debug_forward(x, verbose=True, drop_special_tokens=True)
+    ok(f"debug_forward thành công → feats shape = {list(feats_debug.shape)}")
+
+    # 2. forward tiêu chuẩn
+    feats = enc(x, drop_special_tokens=True)
+    assert feats.shape == feats_debug.shape, "Shape không khớp giữa debug_forward và forward!"
+    ok(f"forward tiêu chuẩn thành công → feats shape = {list(feats.shape)}")
+
+    # Kiểm tra tính toán patch count
+    expected_patches = enc.compute_num_patches(img_size)
+    assert feats.shape[1] == expected_patches, (
+        f"Mismatch patch count: got {feats.shape[1]}, expected {expected_patches}"
+    )
+    ok(f"Số lượng patch tokens khớp 100% với grid hình học: {expected_patches} tokens.")
+    ok(f"Device output : {feats.device}")
+    ok(f"Dtype output  : {feats.dtype}")
+
+
+def test_invalid_inputs(model_id: str):
+    section("TEST 6 — Kiểm tra Validation Tensor đầu vào")
+
+    enc = ImageEncoder(model_id).to(DEVICE)
+
+    # Case 1: Rank != 4
+    try:
+        x_3d = torch.randn(3, 224, 224, device=DEVICE)
+        enc(x_3d)
+        fail("Tensor 3D lẽ ra phải raise ValueError")
+    except ValueError as e:
+        ok(f"Tensor 3D bị chặn chính xác: {e}")
+
+    # Case 2: Ảnh không phải hình vuông
+    try:
+        x_rect = torch.randn(2, 3, 224, 256, device=DEVICE)
+        enc(x_rect)
+        fail("Ảnh chữ nhật (non-square) lẽ ra phải raise ValueError")
+    except ValueError as e:
+        ok(f"Ảnh chữ nhật bị chặn chính xác: {e}")
+
+
+def test_grad_flow(model_id: str):
+    section("TEST 7 — Gradient Flow (Kiểm toán Đồ thị Tự động - Graph Auditing)")
+
+    enc = ImageEncoder(model_id, return_layer=-2).to(DEVICE)
     enc.set_train_mode(TrainMode.PARTIAL, ratio=0.25)
     enc.train()
-    x      = make_input()
-    feats  = enc(x)                          
-    loss   = feats.mean()
+
+    img_size = IMG_SIZE
+    if img_size % enc.patch_size != 0:
+        img_size = enc.patch_size * 16
+
+    x = make_input(img_size=img_size)
+    feats = enc(x)
+    loss = feats.mean()
     loss.backward()
 
-    # Gọi hàm hiển thị chi tiết trực quan của bạn
-    enc.check_grad_flow()
+    enc.check_grad_flow(warn_no_backward=False)
 
-    # -----------------------------------------------------------
-    # LOGIC KIỂM TOÁN ĐỒ THỊ TỰ ĐỘNG (AUTOMATED GRAPH AUDITING)
-    # -----------------------------------------------------------
-    # Do enc.return_layer đã được tự động chuẩn hóa thành index dương (ví dụ: 23)
-    # Layer lớn nhất đóng góp vào feats này sẽ là: return_layer - 1 (ví dụ: layer 22)
+    # Auditing graph logic
     max_active_layer_idx = enc.return_layer - 1
     num_hidden = enc._get_num_hidden_states()
     is_last_state = (enc.return_layer == num_hidden - 1)
 
-    missing_grad = []      # Lẽ ra phải có grad nhưng lại bị None (Lỗi đứt gãy đồ thị)
-    unexpected_grad = []   # Lẽ ra phải là None nhưng lại có grad (Lỗi rò rỉ đồ thị)
+    missing_grad = []
+    unexpected_grad = []
+
+    layer_path_markers = ["encoder.layer.", "encoder.layers.", "model.layers."]
 
     for name, p in enc.named_parameters():
         if not p.requires_grad:
-            continue  # Bỏ qua các lớp đã bị đóng băng hoàn toàn (FROZEN)
-        
-        # Mặc định coi lớp đó nằm trong luồng tính toán (Upstream)
+            continue
+
         is_downstream_isolated = False
-        
-        # 1. Kiểm tra nếu thuộc các khối Encoder Block
-        if "encoder.layer." in name:
-            # Trích xuất số thứ tự layer từ chuỗi "model.encoder.layer.X. ..."
-            layer_idx = int(name.split("encoder.layer.")[1].split(".")[0])
+        matched_marker = next((m for m in layer_path_markers if m in name), None)
+
+        if matched_marker is not None:
+            layer_idx = int(name.split(matched_marker)[1].split(".")[0])
             if layer_idx > max_active_layer_idx:
                 is_downstream_isolated = True
-                
-        # 2. Kiểm tra nếu thuộc final layernorm
-        elif "layernorm" in name and not is_last_state:
+        elif any(kw in name.lower() for kw in ["layernorm", "layer_norm", "norm", "ln_f"]) and not is_last_state:
+            # Nếu không nằm trong từng block encoder.layer.X và return_layer chưa tới last layer
             is_downstream_isolated = True
 
-        # ---- Tiến hành đối chiếu hệ thống ----
         if is_downstream_isolated:
-            # Các lớp nằm sau điểm cắt đồ thị BẮT BUỘC grad phải bằng None
             if p.grad is not None:
                 unexpected_grad.append(name)
         else:
-            # Các lớp nằm trước hoặc bằng điểm cắt đồ thị BẮT BUỘC phải sinh grad
             if p.grad is None:
                 missing_grad.append(name)
 
-    # -----------------------------------------------------------
-    # ĐÁNH GIÁ VÀ NGHIỆM THU
-    # -----------------------------------------------------------
     if missing_grad:
-        fail(f"Phát hiện lỗi đứt gãy đồ thị! {len(missing_grad)} tham số thiếu grad: {missing_grad[:3]}...")
+        fail(f"Phát hiện đứt gãy đồ thị! {len(missing_grad)} tham số thiếu grad: {missing_grad[:3]}...")
         raise AssertionError("Computational graph broke early.")
-        
     elif unexpected_grad:
-        fail(f"Phát hiện lỗi rò rỉ đồ thị! {len(unexpected_grad)} tham số tính toán thừa: {unexpected_grad[:3]}...")
+        fail(f"Phát hiện rò rỉ đồ thị! {len(unexpected_grad)} tham số downstream vẫn có grad: {unexpected_grad[:3]}...")
         raise AssertionError("Computational graph leaked downstream.")
-        
     else:
-        ok("Hệ thống Đồ thị tính toán đạt độ chính xác 100%!")
-        ok(f"  -> Luồng upstream (<= layer.{max_active_layer_idx}) sinh gradient và cập nhật tốt.")
-        if max_active_layer_idx < len(enc.layers) - 1:
-            ok(f"  -> Luồng downstream (>= layer.{max_active_layer_idx+1}) ngắt graph tự động thành công (Tiết kiệm bộ nhớ).")
+        ok("Đồ thị tính toán Gradient Flow chính xác 100%!")
 
 
-# ------------------------------------------------------------------
-# Test 6 — Kiểm tra warn khi chưa backward
-# ------------------------------------------------------------------
-def test_grad_flow_no_backward():
-    section("TEST 6 — check_grad_flow khi chưa backward (expect warning)")
+def test_grad_flow_no_backward(model_id: str):
+    section("TEST 8 — Kiểm tra Cảnh báo check_grad_flow khi chưa backward")
 
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
+    enc = ImageEncoder(model_id).to(DEVICE)
     enc.set_train_mode(TrainMode.PARTIAL, ratio=0.25)
-    # KHÔNG gọi backward
     enc.check_grad_flow(warn_no_backward=True)
-    ok("Warning hiển thị đúng (xem output ở trên)")
+    ok("Cảnh báo hiển thị chính xác.")
 
 
-# ------------------------------------------------------------------
-# Test 7 — Gradient checkpointing
-# ------------------------------------------------------------------
-def test_grad_checkpointing():
-    section("TEST 7 — Gradient checkpointing")
+def test_grad_checkpointing(model_id: str):
+    section("TEST 9 — Kích hoạt Gradient Checkpointing")
 
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
+    enc = ImageEncoder(model_id).to(DEVICE)
     enc.set_train_mode(TrainMode.PARTIAL, ratio=0.25)
 
     try:
         enc.enable_gradient_checkpointing()
-        ok("enable_gradient_checkpointing OK")
+        ok("enable_gradient_checkpointing() thành công.")
 
-        x     = make_input().requires_grad_(False)
+        img_size = IMG_SIZE
+        if img_size % enc.patch_size != 0:
+            img_size = enc.patch_size * 16
+
+        x = make_input(img_size=img_size)
         feats = enc(x)
-        loss  = feats.mean()
+        loss = feats.mean()
         loss.backward()
-        ok("Backward với gradient checkpointing OK")
+        ok("Backward pass với Gradient Checkpointing thành công!")
 
         enc.disable_gradient_checkpointing()
-        ok("disable_gradient_checkpointing OK")
+        ok("disable_gradient_checkpointing() thành công.")
     except Exception as e:
-        warn(f"Gradient checkpointing không được hỗ trợ bởi model này: {e}")
+        warn(f"Gradient Checkpointing gặp vấn đề: {e}")
 
-# ------------------------------------------------------------------
-# Test 8 — print helpers không crash
-# ------------------------------------------------------------------
-def test_print_helpers():
-    section("TEST 8 — print_full_layers / print_trainable_params / summary")
 
-    enc = ImageEncoder(MODEL_ID).to(DEVICE)
+def test_print_helpers(model_id: str):
+    section("TEST 10 — Các hàm In & Hiển thị Thông tin (summary, print_full_layers)")
+
+    enc = ImageEncoder(model_id).to(DEVICE)
 
     for mode in [TrainMode.FROZEN, TrainMode.PARTIAL, TrainMode.FULL]:
         enc.set_train_mode(mode, ratio=0.2)
-        print(f"\n--- {mode.value} ---")
+        print(f"\n--- TrainMode: {mode.value} ---")
         enc.print_trainable_params()
 
     enc.print_full_layers()
     enc.summary()
-    ok("Tất cả print helpers OK")
+    ok("Tất cả print helpers thực thi trơn tru mà không có lỗi.")
+
 
 # ------------------------------------------------------------------
-# Main
+# Main Test Suite Runner
 # ------------------------------------------------------------------
+
 def main():
-    # 1. Kích hoạt bộ chuyển hướng luồng sang File Log song song với Console
-    logger = DecoderLogger(LOG_FILE)
+    parser = argparse.ArgumentParser(description="ImageEncoder Debug & Test Suite")
+    parser.add_argument("--model_id", type=str, default=DEFAULT_MODEL_ID, help="HuggingFace model ID")
+    args = parser.parse_args()
+
+    logger = DualLogger(LOG_FILE)
     sys.stdout = logger
 
     print(f"\n{'#' * 70}")
-    print(f"  ImageEncoder Debug Suite")
-    print(f"  Model  : {MODEL_ID}")
-    print(f"  Device : {DEVICE}")
-    print(f"  Log    : Ghi đồng thời ra file '{LOG_FILE}'")
+    print(f"  IMAGE ENCODER 2 DEBUG & TEST SUITE")
+    print(f"  Model ID : {args.model_id}")
+    print(f"  Device   : {DEVICE}")
+    print(f"  Log File : {LOG_FILE}")
     print(f"{'#' * 70}")
 
     tests = [
-        ("Init",                   test_init),
-        ("Return layer validation", test_return_layer),
-        ("Train modes",            test_train_modes),
-        ("Forward pass",           test_forward),
-        ("Gradient flow",          test_grad_flow),
-        ("Grad flow no backward",  test_grad_flow_no_backward),
-        ("Gradient checkpointing", test_grad_checkpointing),
-        ("Print helpers",          test_print_helpers),
+        ("Khởi tạo & Thuộc tính", lambda: test_init(args.model_id)),
+        ("Validate return_layer", lambda: test_return_layer(args.model_id)),
+        ("Chế độ TrainMode", lambda: test_train_modes(args.model_id)),
+        ("Hình học Token", lambda: test_token_geometry(args.model_id)),
+        ("Forward Pass", lambda: test_forward(args.model_id)),
+        ("Input Validation", lambda: test_invalid_inputs(args.model_id)),
+        ("Gradient Flow", lambda: test_grad_flow(args.model_id)),
+        ("Grad flow cảnh báo", lambda: test_grad_flow_no_backward(args.model_id)),
+        ("Gradient Checkpointing", lambda: test_grad_checkpointing(args.model_id)),
+        ("Print Helpers", lambda: test_print_helpers(args.model_id)),
     ]
 
     passed, failed = 0, 0
@@ -320,19 +395,21 @@ def main():
         try:
             fn()
             passed += 1
-        except Exception as e:
-            fail(f"[{name}] crash không mong muốn:")
-            # Định hướng traceback in thẳng vào sys.stdout (để logger bắt được vào file)
+        except Exception:
+            fail(f"[{name}] Thất bại hoặc Crash không mong muốn:")
             traceback.print_exc(file=sys.stdout)
             failed += 1
 
     print(f"\n{SEP}")
-    print(f"  KẾT QUẢ:  ✅ {passed} passed   ❌ {failed} failed")
+    print(f"  KẾT QUẢ KIỂM THỬ TỔNG THỂ:  ✅ {passed} Passed   |   ❌ {failed} Failed")
     print(f"{SEP}\n")
-    
-    # 2. Khôi phục lại luồng hệ thống cũ và đóng file một cách an toàn
+
     sys.stdout = logger.terminal
     logger.close()
+
+    if failed > 0:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
