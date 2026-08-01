@@ -20,7 +20,7 @@ class QwenProjector(nn.Module):
         self,
         qformer_dim: int = 768,
         hidden_dim: int = 1536,
-        llm_dim: int = 3584,  # Mặc định chuẩn cho Qwen2.5-7B
+        llm_dim: int = 3584,  
         zero_init_last_layer: bool = True
     ):
         super().__init__()

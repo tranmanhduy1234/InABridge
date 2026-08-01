@@ -1,5 +1,5 @@
-# IMAGE ENCODER CONFIG
-IMAGE_ENCODER_MODEL_ID = "facebook/dinov3-large"
+# IMAGE ENCODER CONFIG (DINOv3 for InA-Bridge)
+IMAGE_ENCODER_MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 IMAGE_SIZE2MODEL = 448
 DO_CENTER_CROP = False
 RETURN_LAYER = -2
@@ -7,7 +7,7 @@ IMAGE_ENCODER_OUT_DIMENSION = 1024
 
 # QFormer Config
 Q_FORMER_LOAD_MODEL="microsoft/deberta-v3-base"
-NUM_QUERIES = 128
+NUM_QUERIES = 32
 
 # Multi Layer Perception Config
 MLP_IN_DIMENSION = 768

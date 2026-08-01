@@ -28,7 +28,7 @@ class InABridgeModel(nn.Module):
     InA-Bridge: Instruction-Aware Bridge Vision-Language Model.
 
     Kết hợp 4 thành phần chính:
-        1. ImageEncoder  — DINOv3-L (frozen)
+        1. ImageEncoder  — DINOv2-Large (frozen)
         2. QFormer       — DeBERTa-v3 Q-Former (trainable)
         3. QwenProjector — SwiGLU MLP bridge (trainable)
         4. LLM           — Qwen3-4B decoder (frozen / LoRA)
