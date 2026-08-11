@@ -1,0 +1,39 @@
+{
+  "stage": 1,
+  "output_dir": "outputs/stage1",
+  "epochs": 5,
+  "train_batch_size": 16,
+  "eval_batch_size": 16,
+  "gradient_accumulation_steps": 4,
+  "mixed_precision": "bf16",
+  "save_every_steps": 1000,
+  "eval_every_steps": 1000,
+  "data": {
+    "train_manifest": "/data/pretrain/train.jsonl",
+    "validation_manifest": "/data/pretrain/validation.jsonl",
+    "image_root": "/data/pretrain/images",
+    "image_column": "image",
+    "text_column": "text",
+    "num_workers": 12,
+    "max_instruction_length": 128
+  },
+  "optimizer": {
+    "learning_rate": 0.0001,
+    "weight_decay": 0.05,
+    "warmup_ratio": 0.05,
+    "max_grad_norm": 1.0
+  },
+  "loss": {
+    "stage1_itc_weight": 1.0,
+    "stage1_itm_weight": 1.0,
+    "stage1_itg_weight": 1.0,
+    "stage1_itc_label_smoothing": 0.0,
+    "stage1_itm_label_smoothing": 0.0,
+    "stage1_itg_label_smoothing": 0.0,
+    "reduction": "token_mean"
+  },
+  "model": {
+    "llm_train_mode": "frozen",
+    "gradient_checkpointing": false
+  }
+}

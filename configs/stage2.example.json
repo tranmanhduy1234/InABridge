@@ -1,0 +1,44 @@
+{
+  "stage": 2,
+  "output_dir": "outputs/stage2",
+  "epochs": 3,
+  "train_batch_size": 2,
+  "eval_batch_size": 2,
+  "gradient_accumulation_steps": 16,
+  "mixed_precision": "bf16",
+  "save_every_steps": 500,
+  "eval_every_steps": 500,
+  "data": {
+    "train_manifest": "/data/instructions/train.jsonl",
+    "validation_manifest": "/data/instructions/validation.jsonl",
+    "image_root": "/data/instructions/images",
+    "image_column": "image",
+    "instruction_column": "instruction",
+    "answer_column": "answer",
+    "num_workers": 8,
+    "max_instruction_length": 128,
+    "max_text_length": 512
+  },
+  "optimizer": {
+    "learning_rate": 0.0001,
+    "projector_learning_rate": 0.0001,
+    "lora_learning_rate": 0.00002,
+    "weight_decay": 0.05,
+    "warmup_ratio": 0.03,
+    "max_grad_norm": 1.0
+  },
+  "loss": {
+    "stage2_label_smoothing": 0.0,
+    "stage2_z_loss_weight": 0.0001,
+    "reduction": "token_mean"
+  },
+  "model": {
+    "llm_train_mode": "qlora",
+    "bridge_checkpoint": "/checkpoints/stage1/checkpoint-00010000/bridge_model.pt",
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "lora_dropout": 0.05,
+    "tune_qformer_stage2": true,
+    "gradient_checkpointing": true
+  }
+}

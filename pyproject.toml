@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ina-bridge"
+version = "0.1.0"
+description = "Instruction-aware DINOv3 to Qwen3 vision-language bridge"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=5.0",
+  "accelerate>=1.0",
+  "sentencepiece>=0.2",
+  "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+train = ["peft>=0.14", "bitsandbytes>=0.45", "datasets>=3.0", "tensorboard>=2.18"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+ina-bridge-train = "src.training.cli:main"
+ina-bridge-infer = "src.inference.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
