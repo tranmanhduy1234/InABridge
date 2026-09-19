@@ -1,10 +1,22 @@
 # MODEL
+BERT_MODEL_ID = "bert-base-uncased"  # Ví dụ: "bert-base-uncased"; pretrained BERT dùng cho embeddings và khởi tạo Q-Former.
+VISION_MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"  # Ví dụ: "facebook/dinov3-vitl16-pretrain-lvd1689m"; pretrained vision encoder DINOv3.
+VISION_RETURN_LAYER = -1  # Ví dụ: -1; lấy hidden states của lớp cuối vision encoder.
+NUM_QUERIES = 128  # Ví dụ: 128; số query tokens học được của Q-Former.
+CROSS_ATTN_EVERY = 2  # Ví dụ: 2; thêm cross-attention mỗi 2 block, bắt đầu từ block đầu tiên.
+HIDDEN_DIM = 768  # Ví dụ: 768; chiều hidden của Q-Former, phải khớp hidden_size của BERT.
+ITC_DIM = 256  # Ví dụ: 256; chiều embedding ảnh và text dùng cho ITC.
+NORMALIZE_EPS = 1e-12  # Ví dụ: 1e-12; ngưỡng tránh chia cho 0 khi chuẩn hóa embedding ITC.
+MOMENTUM = 0.995  # Ví dụ: 0.995; hệ số EMA, cập nhật momentum = m * momentum + (1 - m) * online.
 
 # DATALOADER
 IS_TRAINING = True  # Ví dụ: True; bật augmentation train và chọn cache train.sqlite.
-JSON_PATH = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/train.json"; manifest ảnh–text, đường dẫn tương đối từ gốc dự án hoặc tuyệt đối.
-IMAGE_DIR = "DatasetProject/BLIP3o/Image"  # Ví dụ: "data/images"; thư mục chứa ảnh được tham chiếu trong manifest.
+JSON_PATH_TRAIN = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/train.json"; manifest ảnh–text, đường dẫn tương đối từ gốc dự án hoặc tuyệt đối.
+IMAGE_DIR = "DatasetProject/BLIP3o/Image"  # Ví dụ: "data/images"; thư mục ảnh dùng chung cho train và validation, hai tập được phân chia bằng JSON.
+JSON_PATH_VAL = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/validation.json"; manifest validation, dùng tập riêng khi đánh giá mô hình.
+
 CACHE_DIR = "cache/dataloader_demo"  # Ví dụ: "cache/train"; thư mục SQLite cache, cần đổi hoặc xóa cache khi đổi manifest.
+
 CACHE_CHUNK_SIZE = 1000  # Ví dụ: 1000; số bản ghi mỗi lần ghi metadata vào SQLite.
 
 IMAGE_SIZE = 640  # Ví dụ: 640; chiều cao và rộng ảnh đầu ra, tính bằng pixel.
@@ -21,7 +33,7 @@ BLUR_KERNEL_SIZE = 5  # Ví dụ: 5; kích thước kernel Gaussian blur, là s�
 BLUR_SIGMA = (0.1, 1.5)  # Ví dụ: (0.1, 1.5); khoảng sigma được lấy ngẫu nhiên cho Gaussian blur.
 BLUR_PROBABILITY = 0.1  # Ví dụ: 0.1; xác suất làm mờ ảnh khi train.
 
-TOKENIZER_MODEL_ID = "bert-base-uncased"  # Ví dụ: "bert-base-uncased"; tên hoặc đường dẫn tokenizer, phải khớp với text embeddings của model.
+TOKENIZER_MODEL_ID = BERT_MODEL_ID  # Ví dụ: "bert-base-uncased"; tên hoặc đường dẫn tokenizer, phải khớp với text embeddings của model.
 TOKENIZER_USE_FAST = True  # Ví dụ: True; ưu tiên phiên bản tokenizer fast nếu có.
 MAX_LENGTH = 128  # Ví dụ: 128; giới hạn số token mỗi văn bản khi bật truncation.
 TOKENIZER_PADDING = True  # Ví dụ: True hoặc "max_length"; pad đến câu dài nhất trong batch hoặc đến MAX_LENGTH.
