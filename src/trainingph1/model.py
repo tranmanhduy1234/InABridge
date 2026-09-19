@@ -12,6 +12,11 @@ class ITCEncoder(nn.Module):
         self.normalize_eps = normalize_eps
         self.query_proj = nn.Linear(qformer.hidden_dim, itc_dim, bias=False)
         self.text_proj = nn.Linear(qformer.hidden_dim, itc_dim, bias=False)
+        self._init_head()
+
+    def _init_head(self):
+        for head in (self.query_proj, self.text_proj):
+            nn.init.normal_(head.weight, mean=0.0, std=self.qformer.cfg.initializer_range)
 
     def forward(self, image_features, text_embeddings, attn_mask):
         out = self.qformer(image_features, text_embeddings, attn_mask.bool(), "itc")
@@ -36,6 +41,8 @@ class ModelStage1(nn.Module):
         )
         self.itc_encoder = ITCEncoder(qformer, itc_dim, normalize_eps)
         self.itm_logit = nn.Linear(hidden_dim, 2)
+        nn.init.normal_(self.itm_logit.weight, std=bert.config.initializer_range)
+        nn.init.zeros_(self.itm_logit.bias)
         self.lm_head = nn.Linear(hidden_dim, self.embeddings.word_embeddings.num_embeddings, bias=False)
         self.lm_head.weight = self.embeddings.word_embeddings.weight
         self.lm_head.requires_grad_(False).eval()
