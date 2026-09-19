@@ -9,6 +9,8 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import AutoTokenizer
 
+from src import config as cfg
+
 def build_transform(image_size, is_training, normalization,
                     crop_scale, crop_ratio, interpolation,
                     antialias, horizontal_flip_probability,
@@ -118,6 +120,7 @@ class VLMDataCollator:
             "input_ids": tokens["input_ids"],
             "attention_mask": tokens["attention_mask"].bool()
         }
+
 def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
                      drop_last, shuffle, pin_memory, persistent_workers,
                      prefetch_factor, collate_fn):
@@ -135,46 +138,48 @@ def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
 def main():
     import matplotlib.pyplot as plt
     root = Path(__file__).resolve().parents[2]
-    is_training = True
     transforms_aug = build_transform(
-        image_size=640,
-        is_training=is_training,
-        normalization=None,
-        crop_scale=(0.85, 1.0),
-        crop_ratio=(0.9, 1.1),
-        interpolation="bicubic",
-        antialias=True,
-        horizontal_flip_probability=0.3,
-        color_jitter=(0.15, 0.15, 0.15, 0.03),
-        color_jitter_probability=0.4,
-        grayscale_probability=0.05,
-        blur_kernel_size=5,
-        blur_sigma=(0.1, 1.5),
-        blur_probability=0.1,
+        image_size=cfg.IMAGE_SIZE,
+        is_training=cfg.IS_TRAINING,
+        normalization=cfg.NORMALIZATION,
+        crop_scale=cfg.CROP_SCALE,
+        crop_ratio=cfg.CROP_RATIO,
+        interpolation=cfg.INTERPOLATION,
+        antialias=cfg.ANTIALIAS,
+        horizontal_flip_probability=cfg.HORIZONTAL_FLIP_PROBABILITY,
+        color_jitter=cfg.COLOR_JITTER,
+        color_jitter_probability=cfg.COLOR_JITTER_PROBABILITY,
+        grayscale_probability=cfg.GRAYSCALE_PROBABILITY,
+        blur_kernel_size=cfg.BLUR_KERNEL_SIZE,
+        blur_sigma=cfg.BLUR_SIGMA,
+        blur_probability=cfg.BLUR_PROBABILITY,
     )
     dataset = VLMDatasetStage1(
-        json_path=root / "DatasetProject/BLIP3o/dataset_metadata.json",
-        image_dir=root / "DatasetProject/BLIP3o/Image",
-        is_training=is_training,
-        cache_dir=root / "cache/dataloader_demo",
-        chunk_size=1000,
+        json_path=root / cfg.JSON_PATH,
+        image_dir=root / cfg.IMAGE_DIR,
+        is_training=cfg.IS_TRAINING,
+        cache_dir=root / cfg.CACHE_DIR,
+        chunk_size=cfg.CACHE_CHUNK_SIZE,
         transform=transforms_aug,
     )
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.TOKENIZER_MODEL_ID, use_fast=cfg.TOKENIZER_USE_FAST)
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is None:
             raise ValueError("Tokenizer has no PAD/EOS token")
         tokenizer.pad_token = tokenizer.eos_token
-    collator = VLMDataCollator(tokenizer, max_length=128, padding=True, truncation=True)
+    collator = VLMDataCollator(
+        tokenizer, max_length=cfg.MAX_LENGTH,
+        padding=cfg.TOKENIZER_PADDING, truncation=cfg.TOKENIZER_TRUNCATION,
+    )
     loader = build_dataloader(
         dataset=dataset,
-        batch_size=8,
-        num_workers=0,
-        drop_last=False,
-        shuffle=False,
-        pin_memory=False,
-        persistent_workers=False,
-        prefetch_factor=2,
+        batch_size=cfg.BATCH_SIZE,
+        num_workers=cfg.NUM_WORKERS,
+        drop_last=cfg.DROP_LAST,
+        shuffle=cfg.SHUFFLE,
+        pin_memory=cfg.PIN_MEMORY,
+        persistent_workers=cfg.PERSISTENT_WORKERS,
+        prefetch_factor=cfg.PREFETCH_FACTOR,
         collate_fn=collator,
     )
     if len(dataset) == 0:
@@ -182,15 +187,15 @@ def main():
     for batch in loader:
         print({name: tuple(value.shape) for name, value in batch.items()})
 
-        for i in range(min(5, len(batch["images"]))):
+        for i in range(min(cfg.DEMO_NUM_IMAGES, len(batch["images"]))):
             image = batch["images"][i].permute(1, 2, 0)
             caption = tokenizer.decode(batch["input_ids"][i], skip_special_tokens=True)
             print(batch["input_ids"][i])
             print(batch["attention_mask"][i])
             print()
-            plt.figure(figsize=(8, 8))
+            plt.figure(figsize=cfg.DEMO_FIGURE_SIZE)
             plt.imshow(image)
-            plt.title(caption, fontsize=10, wrap=True)
+            plt.title(caption, fontsize=cfg.DEMO_TITLE_FONT_SIZE, wrap=True)
             plt.axis("off")
             plt.tight_layout()
             plt.show()
