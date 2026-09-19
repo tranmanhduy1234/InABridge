@@ -155,7 +155,7 @@ def main():
         blur_probability=cfg.BLUR_PROBABILITY,
     )
     dataset = VLMDatasetStage1(
-        json_path=root / cfg.JSON_PATH,
+        json_path=root / (cfg.JSON_PATH_TRAIN if cfg.IS_TRAINING else cfg.JSON_PATH_VAL),
         image_dir=root / cfg.IMAGE_DIR,
         is_training=cfg.IS_TRAINING,
         cache_dir=root / cfg.CACHE_DIR,
