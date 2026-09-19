@@ -6,7 +6,7 @@ logs/
 *.pt
 *.pth
 *.safetensors
-
+__init__.py
 # Python
 __pycache__/
 *.py[cod]
@@ -35,3 +35,7 @@ venv/
 *.log
 *.out
 *.synctex.gz
+
+/cache
+/tests
+/documents
