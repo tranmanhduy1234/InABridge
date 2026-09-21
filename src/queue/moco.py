@@ -37,7 +37,9 @@ def main():
     import torch
     import torch.nn.functional as F
 
-    torch.manual_seed(42)
+    from src.utils.seed import seed_everything
+
+    seed_everything()
 
     B = 4
     Q = 128

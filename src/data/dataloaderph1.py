@@ -10,6 +10,7 @@ from torchvision.transforms import InterpolationMode
 from transformers import AutoTokenizer
 
 from src import config as cfg
+from src.utils.seed import seed_everything, seed_worker
 
 def build_transform(image_size, is_training, normalization,
                     crop_scale, crop_ratio, interpolation,
@@ -129,13 +130,14 @@ def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
         drop_last=drop_last if dataset.is_training else False, num_workers=num_workers,
         pin_memory=torch.cuda.is_available() if pin_memory is None else pin_memory,
         persistent_workers=persistent_workers and num_workers > 0,
-        collate_fn=collate_fn
+        collate_fn=collate_fn, worker_init_fn=seed_worker
     )
     if num_workers > 0:
         kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(**kwargs)
 
 def main():
+    seed_everything()
     import matplotlib.pyplot as plt
     root = Path(__file__).resolve().parents[2]
     transforms_aug = build_transform(
