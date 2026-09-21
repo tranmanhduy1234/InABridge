@@ -1,6 +1,11 @@
 # Local datasets and model artifacts
 DatasetProject/
 checkpoints/
+!src/checkpoints/
+src/checkpoints/*
+!src/checkpoints/stage1/
+src/checkpoints/stage1/*
+!src/checkpoints/stage1/manager.json
 outputs/
 logs/
 *.pt
@@ -37,5 +42,6 @@ venv/
 *.synctex.gz
 
 /cache
-/tests
+/tests/*
+!/tests/test_checkpoint.py
 /documents
