@@ -154,3 +154,31 @@ python -m src.data.dataloaderph1
 Các demo model cần tải hoặc có sẵn pretrained weights; quyền truy cập model trên Hugging Face cần phù hợp với model được sử dụng. Demo dataloader hiện trỏ tới `DatasetProject/BLIP3o/dataset_metadata.json` và thư mục ảnh `DatasetProject/BLIP3o/Image`.
 
 Demo forward dùng ảnh ngẫu nhiên để kiểm tra luồng tensor, không đánh giá chất lượng mô hình. Luồng train hoàn chỉnh trong `src/` sẽ được bổ sung sau khi triển khai criterion, engine và cấu hình.
+
+## Checkpoint cho fine-tune
+
+`src/checkpoints/stage1/manager.json` quy định định dạng và điều kiện tương thích. Mỗi checkpoint chứa toàn bộ trọng số, cấu hình BERT/DINOv3 đã resolve, kiến trúc Q-Former, fast tokenizer và cấu hình xử lý đầu vào. `load_pretrained` dựng lại Stage1 trên CPU từ các dữ liệu này, không gọi `from_pretrained` hay dùng kiến trúc trong `config.py` hiện tại:
+
+```python
+from src.trainingph1.engine import get_dataloader, get_optimizer
+from src.utils.checkpoint import load_pretrained, save_checkpoint
+
+model, tokenizer, pretrained_config = load_pretrained(checkpoint_path)
+train_loader, val_loader = get_dataloader(tokenizer, pretrained_config)
+model = model.to("cuda").train()
+optimizer = get_optimizer(model)  # Optimizer mới, LR từ config của lần fine-tune.
+```
+
+`get_dataloader(tokenizer, pretrained_config)` dùng cấu hình đã lưu cho kích thước ảnh, normalization, resize và tokenization; dataset, augmentation và tùy chọn loader lấy từ config hiện tại. Không tạo lại tokenizer từ model ID hiện tại. LR và lịch training có thể chọn riêng cho fine-tune.
+
+`save_checkpoint(model, tokenizer, global_step)` giữ cấu hình đầu vào của checkpoint đã load; truyền `settings=...` (dictionary) nếu chủ động đổi cấu hình đầu vào cho lần fine-tune. Kiến trúc được lấy từ model thực tế. `load_checkpoint(path, model, tokenizer)` dành cho model đã dựng sẵn và trả lại `training_state` để engine khôi phục khi resume; `load_pretrained` chỉ nạp trọng số, không khôi phục optimizer, EMA, queue hay step của pretrain.
+
+Loader vẫn từ chối sai kiến trúc, tokenizer, mã nguồn hoặc phiên bản thư viện. Schema v3 lưu thêm toàn bộ `run_config` và so khớp cấu hình training khi resume; checkpoint schema cũ cần migration riêng, không tự động bỏ qua kiểm tra. Bộ kiểm thử chạy offline với BERT/DINOv3 nhỏ: `python -m unittest discover -s tests -p test_checkpoint.py -v`.
+
+Mọi biến trong `config.py` phải được phân loại trong manager: `compatibility_fields` cho kiến trúc/đầu vào, `resume_fields` cho dữ liệu và training, `runtime_fields` cho đường dẫn/thiết bị/logging, `demo_fields` cho demo. Thêm biến chưa phân loại sẽ làm kiểm tra checkpoint báo lỗi. `CHECKPOINT_DIR` chọn nơi lưu trọng số; `OUTPUT_DIR` dành cho log và kết quả khác.
+
+`get_scheduler(optimizer, batches_per_epoch=len(train_loader))` tính số optimizer step mỗi epoch bằng `ceil(batches / ACCUMULATION_STEPS)`, warmup theo `WARMUP_EPOCHS`, tổng thời gian theo `EPOCHS`, và giảm xuống `MIN_LR`. `get_criterion(epoch_progress)` nhận tiến độ epoch có phần thập phân để khởi tạo pseudo weight theo `PSEUDO_WARMUP_EPOCHS`.
+
+Vòng lặp `train_one_epoch`, `validate`, `run_training` và các tiện ích logging hiện chưa triển khai. Chúng vẫn cần thực thi accumulation, AMP, clipping, cập nhật pseudo weight theo tiến độ, queue/EMA, loss tổng (ITM/ITG chưa có criterion), lịch log/save/validate theo step và khôi phục `training_state`. Các cấu hình này đã được lưu và kiểm tra khi resume nhưng chưa tự kích hoạt các hành vi đó.
+
+Seed chung được khởi tạo bằng `src.utils.seed.seed_everything()`, mặc định lấy `config.SEED`; có thể truyền seed riêng. Gọi trước khi tạo model và dataloader. Hàm seed Python, NumPy và PyTorch (CPU/CUDA); worker dataloader dùng seed riêng do PyTorch cấp. Seed không ép thuật toán deterministic. Khi resume chính xác, engine cần khôi phục trạng thái RNG từ checkpoint sau bước khởi tạo.
