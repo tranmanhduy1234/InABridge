@@ -147,7 +147,9 @@ class QFormer(nn.Module):
 def main():
     from transformers import AutoTokenizer, BertModel
 
-    torch.manual_seed(42)
+    from src.utils.seed import seed_everything
+
+    seed_everything()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
     bert = BertModel.from_pretrained("bert-base-uncased", add_pooling_layer=False)
