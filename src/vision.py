@@ -3,11 +3,12 @@ import torch.nn as nn
 from transformers import DINOv3ViTModel
 
 class ImageEncoder(nn.Module):
-    def __init__(self, return_layer, model_id):
+    def __init__(self, return_layer, model_id, model_config=None):
         super().__init__()
         self.return_layer = return_layer
         self.model_id = model_id
-        self.model = DINOv3ViTModel.from_pretrained(model_id)
+        self.model = (DINOv3ViTModel.from_pretrained(model_id) if model_config is None
+                      else DINOv3ViTModel(model_config))
         self.model.requires_grad_(False)
         self.model.eval()
 
@@ -45,7 +46,9 @@ class ImageEncoder(nn.Module):
         return features[:, num_prefix_tokens:, :]
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
+    from src.utils.seed import seed_everything
+
+    seed_everything()
     encoder = ImageEncoder(-1, "facebook/dinov3-vitl16-pretrain-lvd1689m").to("cuda")
     encoder.train()
     print("Compute grid shape: ", encoder.compute_grid_shape(512, 512))
