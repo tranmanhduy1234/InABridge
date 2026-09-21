@@ -14,13 +14,11 @@ IS_TRAINING = True  # Ví dụ: True; bật augmentation train và chọn cache 
 JSON_PATH_TRAIN = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/train.json"; manifest ảnh–text, đường dẫn tương đối từ gốc dự án hoặc tuyệt đối.
 IMAGE_DIR = "DatasetProject/BLIP3o/Image"  # Ví dụ: "data/images"; thư mục ảnh dùng chung cho train và validation, hai tập được phân chia bằng JSON.
 JSON_PATH_VAL = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/validation.json"; manifest validation, dùng tập riêng khi đánh giá mô hình.
-
 CACHE_DIR = "cache/dataloader_demo"  # Ví dụ: "cache/train"; thư mục SQLite cache, cần đổi hoặc xóa cache khi đổi manifest.
-
 CACHE_CHUNK_SIZE = 1000  # Ví dụ: 1000; số bản ghi mỗi lần ghi metadata vào SQLite.
 
 IMAGE_SIZE = 640  # Ví dụ: 640; chiều cao và rộng ảnh đầu ra, tính bằng pixel.
-NORMALIZATION = None  # Ví dụ: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)); (mean, std) theo RGB, None để bỏ chuẩn hóa; khi train dùng giá trị của vision encoder.
+NORMALIZATION = None  # (mean, std) theo RGB; None bỏ chuẩn hóa, không tự lấy từ vision encoder.
 CROP_SCALE = (0.85, 1.0)  # Ví dụ: (0.85, 1.0); khoảng tỷ lệ diện tích crop so với ảnh gốc.
 CROP_RATIO = (0.9, 1.1)  # Ví dụ: (0.9, 1.1); khoảng tỷ lệ chiều rộng/chiều cao của crop.
 INTERPOLATION = "bicubic"  # Ví dụ: "bicubic"; phương pháp nội suy khi resize ảnh.
@@ -33,8 +31,9 @@ BLUR_KERNEL_SIZE = 5  # Ví dụ: 5; kích thước kernel Gaussian blur, là s�
 BLUR_SIGMA = (0.1, 1.5)  # Ví dụ: (0.1, 1.5); khoảng sigma được lấy ngẫu nhiên cho Gaussian blur.
 BLUR_PROBABILITY = 0.1  # Ví dụ: 0.1; xác suất làm mờ ảnh khi train.
 
+# Tokenizer
 TOKENIZER_MODEL_ID = BERT_MODEL_ID  # Ví dụ: "bert-base-uncased"; tên hoặc đường dẫn tokenizer, phải khớp với text embeddings của model.
-TOKENIZER_USE_FAST = True  # Ví dụ: True; ưu tiên phiên bản tokenizer fast nếu có.
+TOKENIZER_USE_FAST = True  # Checkpoint yêu cầu fast tokenizer để lưu và khôi phục đầy đủ backend.
 MAX_LENGTH = 128  # Ví dụ: 128; giới hạn số token mỗi văn bản khi bật truncation.
 TOKENIZER_PADDING = True  # Ví dụ: True hoặc "max_length"; pad đến câu dài nhất trong batch hoặc đến MAX_LENGTH.
 TOKENIZER_TRUNCATION = True  # Ví dụ: True; cắt văn bản vượt quá MAX_LENGTH.
@@ -51,3 +50,39 @@ PREFETCH_FACTOR = 2  # Ví dụ: 2; số batch mỗi worker nạp trước, ch�
 DEMO_NUM_IMAGES = 5  # Ví dụ: 5; số ảnh tối đa hiển thị trong mỗi batch của demo.
 DEMO_FIGURE_SIZE = (8, 8)  # Ví dụ: (8, 8); kích thước khung hình demo theo inch.
 DEMO_TITLE_FONT_SIZE = 10  # Ví dụ: 10; cỡ chữ caption trong hình demo.
+
+# ENGINE TRAINING
+SEED = 42  # Seed cho Python, NumPy và PyTorch khi khởi tạo training.
+DEVICE = "cuda"  # Thiết bị training: "cuda", "cuda:0" hoặc "cpu".
+EPOCHS = 20  # Tổng số epoch training.
+WARMUP_EPOCHS = 1  # Số epoch tăng learning rate tuyến tính từ 0 lên LR trước cosine decay.
+ACCUMULATION_STEPS = 1  # Số micro-batch mỗi optimizer step; batch hiệu dụng = BATCH_SIZE * giá trị này trên mỗi GPU.
+
+# AdamW và warmup + cosine scheduler; scheduler.step() theo optimizer step.
+LR = 1e-4  # Learning rate đỉnh sau warmup.
+MIN_LR = 5e-6  # Learning rate cuối cosine decay; min_lr_ratio = MIN_LR / LR.
+WEIGHT_DECAY = 0.05  # Weight decay cho các trọng số được regularize.
+ADAM_BETAS = (0.9, 0.999)  # Hệ số trung bình động gradient và bình phương gradient của AdamW.
+ADAM_EPS = 1e-8  # Hằng số ổn định số học trong mẫu số AdamW.
+MAX_GRAD_NORM = 1.0  # Ngưỡng clip gradient sau unscale và trước optimizer step; None để tắt.
+
+AMP_ENABLED = True  # Bật mixed precision khi thiết bị hỗ trợ.
+AMP_DTYPE = "bfloat16"  # "bfloat16" hoặc "float16"; float16 cần GradScaler trên CUDA.
+
+# Stage1Criterion và MoCoQueue.
+ITC_WEIGHT = 1.0  # Trọng số image-text contrastive loss.
+ITM_WEIGHT = 1.0  # Trọng số image-text matching loss.
+ITG_WEIGHT = 1.0  # Trọng số image-grounded text generation loss.
+PSEUDO_WEIGHT = 0.4  # Tỷ lệ soft targets đích từ momentum model trong ITC, thuộc [0, 1]; giữ cố định sau warmup.
+PSEUDO_WARMUP_EPOCHS = 1  # Tăng tuyến tính pseudo weight từ 0 lên PSEUDO_WEIGHT theo tiến độ trong số epoch này; 0 để áp dụng mức đích ngay.
+TEMPERATURE = 0.07  # Temperature dương dùng để tính logits ITC.
+QUEUE_SIZE = 4096  # Số cặp feature ảnh–text tối đa lưu trong MoCoQueue.
+
+OUTPUT_DIR = "outputs/stage1"  # Thư mục log và kết quả training, tính từ gốc dự án.
+CHECKPOINT_DIR = "src/checkpoints/stage1"  # Thư mục chứa các checkpoint theo fingerprint; manager.json định nghĩa định dạng.
+RESUME_CHECKPOINT = None  # Đường dẫn checkpoint để tiếp tục training; None để bắt đầu mới.
+# Step là số lần cập nhật optimizer thành công sau accumulation, không tính step bị AMP bỏ qua.
+# Đếm global step xuyên suốt các epoch và khôi phục từ checkpoint khi resume.
+SAVE_EVERY_STEPS = 1000  # Chu kỳ lưu checkpoint, tính bằng optimizer step.
+VAL_EVERY_STEPS = 1000  # Chu kỳ chạy validation, tính bằng optimizer step.
+LOG_EVERY_STEPS = 10  # Chu kỳ ghi log, tính bằng optimizer step.
