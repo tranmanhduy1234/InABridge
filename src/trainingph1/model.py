@@ -19,7 +19,7 @@ class ITCEncoder(nn.Module):
             nn.init.normal_(head.weight, mean=0.0, std=self.qformer.cfg.initializer_range)
 
     def forward(self, image_features, text_embeddings, attn_mask):
-        out = self.qformer(image_features, text_embeddings, attn_mask.bool(), "itc")
+        out = self.qformer(image_features, text_embeddings, attn_mask, "itc")
         return {
             "image_features": F.normalize(self.query_proj(out["query_output"]), dim=-1, eps=self.normalize_eps),
             "text_features": F.normalize(self.text_proj(out["text_output"][:, 0]), dim=-1, eps=self.normalize_eps),
@@ -43,12 +43,11 @@ class ModelStage1(nn.Module):
             hidden_dim=hidden_dim,
         )
         self.itc_encoder = ITCEncoder(qformer, itc_dim, normalize_eps)
-        self.itm_logit = nn.Linear(hidden_dim, 2)
+        self.itm_logit = nn.Linear(hidden_dim, 1)
         nn.init.normal_(self.itm_logit.weight, std=bert.config.initializer_range)
         nn.init.zeros_(self.itm_logit.bias)
         self.lm_head = nn.Linear(hidden_dim, self.embeddings.word_embeddings.num_embeddings, bias=False)
         self.lm_head.weight = self.embeddings.word_embeddings.weight
-        self.lm_head.requires_grad_(False).eval()
 
     @property
     def qformer_model(self):
@@ -75,13 +74,12 @@ class ModelStage1(nn.Module):
             return self.itc_encoder(image_features, text_embeddings, attn_mask)
         out = self.qformer_model(image_features, text_embeddings, attn_mask, objective)
         if objective == "itm":
-            return {"itm_logits": self.itm_logit(out["query_output"]).mean(1)}
+            return {"itm_logits": self.itm_logit(out["query_output"]).mean(1).squeeze(-1)}
         return {"itg_logits": self.lm_head(out["text_output"][:, :-1])}
 
 @torch.inference_mode()
 def main():
     from transformers import AutoTokenizer
-
     from src.utils.seed import seed_everything
 
     seed_everything()

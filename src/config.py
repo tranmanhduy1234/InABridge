@@ -1,15 +1,34 @@
-# MODEL
+# ====================================================================================================
+# CẤU HÌNH DÙNG CHUNG
+# ====================================================================================================
+
+# MODEL / BACKBONE
 BERT_MODEL_ID = "bert-base-uncased"  # Ví dụ: "bert-base-uncased"; pretrained BERT dùng cho embeddings và khởi tạo Q-Former.
 VISION_MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"  # Ví dụ: "facebook/dinov3-vitl16-pretrain-lvd1689m"; pretrained vision encoder DINOv3.
 VISION_RETURN_LAYER = -1  # Ví dụ: -1; lấy hidden states của lớp cuối vision encoder.
 NUM_QUERIES = 128  # Ví dụ: 128; số query tokens học được của Q-Former.
 CROSS_ATTN_EVERY = 2  # Ví dụ: 2; thêm cross-attention mỗi 2 block, bắt đầu từ block đầu tiên.
 HIDDEN_DIM = 768  # Ví dụ: 768; chiều hidden của Q-Former, phải khớp hidden_size của BERT.
+
+# TOKENIZER CHO BERT / Q-FORMER
+TOKENIZER_MODEL_ID = BERT_MODEL_ID  # Ví dụ: "bert-base-uncased"; tên hoặc đường dẫn tokenizer, phải khớp với text embeddings của model.
+TOKENIZER_USE_FAST = True  # Checkpoint yêu cầu fast tokenizer để lưu và khôi phục đầy đủ backend.
+
+# RUNTIME
+SEED = 42  # Seed cho Python, NumPy và PyTorch khi khởi tạo training.
+DEVICE = "cuda"  # Thiết bị training: "cuda", "cuda:0" hoặc "cpu".
+
+# ====================================================================================================
+# STAGE 1
+# ====================================================================================================
+
+# ITC FEATURES VÀ EMA
 ITC_DIM = 256  # Ví dụ: 256; chiều embedding ảnh và text dùng cho ITC.
 NORMALIZE_EPS = 1e-12  # Ví dụ: 1e-12; ngưỡng tránh chia cho 0 khi chuẩn hóa embedding ITC.
 MOMENTUM = 0.995  # Ví dụ: 0.995; hệ số EMA, cập nhật momentum = m * momentum + (1 - m) * online.
 
 # DATALOADER
+DATASET_NAMESPACE = "blip3o"  # Định danh dataset ổn định giữa các máy và train/validation; dùng cùng namespace cho cùng ảnh.
 IS_TRAINING = True  # Ví dụ: True; bật augmentation train và chọn cache train.sqlite.
 JSON_PATH_TRAIN = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/train.json"; manifest ảnh–text, đường dẫn tương đối từ gốc dự án hoặc tuyệt đối.
 IMAGE_DIR = "DatasetProject/BLIP3o/Image"  # Ví dụ: "data/images"; thư mục ảnh dùng chung cho train và validation, hai tập được phân chia bằng JSON.
@@ -31,9 +50,7 @@ BLUR_KERNEL_SIZE = 5  # Ví dụ: 5; kích thước kernel Gaussian blur, là s�
 BLUR_SIGMA = (0.1, 1.5)  # Ví dụ: (0.1, 1.5); khoảng sigma được lấy ngẫu nhiên cho Gaussian blur.
 BLUR_PROBABILITY = 0.1  # Ví dụ: 0.1; xác suất làm mờ ảnh khi train.
 
-# Tokenizer
-TOKENIZER_MODEL_ID = BERT_MODEL_ID  # Ví dụ: "bert-base-uncased"; tên hoặc đường dẫn tokenizer, phải khớp với text embeddings của model.
-TOKENIZER_USE_FAST = True  # Checkpoint yêu cầu fast tokenizer để lưu và khôi phục đầy đủ backend.
+# TOKENIZATION
 MAX_LENGTH = 128  # Ví dụ: 128; giới hạn số token mỗi văn bản khi bật truncation.
 TOKENIZER_PADDING = True  # Ví dụ: True hoặc "max_length"; pad đến câu dài nhất trong batch hoặc đến MAX_LENGTH.
 TOKENIZER_TRUNCATION = True  # Ví dụ: True; cắt văn bản vượt quá MAX_LENGTH.
@@ -52,8 +69,6 @@ DEMO_FIGURE_SIZE = (8, 8)  # Ví dụ: (8, 8); kích thước khung hình demo t
 DEMO_TITLE_FONT_SIZE = 10  # Ví dụ: 10; cỡ chữ caption trong hình demo.
 
 # ENGINE TRAINING
-SEED = 42  # Seed cho Python, NumPy và PyTorch khi khởi tạo training.
-DEVICE = "cuda"  # Thiết bị training: "cuda", "cuda:0" hoặc "cpu".
 EPOCHS = 20  # Tổng số epoch training.
 WARMUP_EPOCHS = 1  # Số epoch tăng learning rate tuyến tính từ 0 lên LR trước cosine decay.
 ACCUMULATION_STEPS = 1  # Số micro-batch mỗi optimizer step; batch hiệu dụng = BATCH_SIZE * giá trị này trên mỗi GPU.
@@ -78,11 +93,22 @@ PSEUDO_WARMUP_EPOCHS = 1  # Tăng tuyến tính pseudo weight từ 0 lên PSEUDO
 TEMPERATURE = 0.07  # Temperature dương dùng để tính logits ITC.
 QUEUE_SIZE = 4096  # Số cặp feature ảnh–text tối đa lưu trong MoCoQueue.
 
+# CHECKPOINT VÀ LOG
 OUTPUT_DIR = "outputs/stage1"  # Thư mục log và kết quả training, tính từ gốc dự án.
-CHECKPOINT_DIR = "src/checkpoints/stage1"  # Thư mục chứa các checkpoint theo fingerprint; manager.json định nghĩa định dạng.
-RESUME_CHECKPOINT = None  # Đường dẫn checkpoint để tiếp tục training; None để bắt đầu mới.
+CHECKPOINT_DIR = "src/checkpoints/stage1"  # Thư mục gốc chứa các lần chạy riêng biệt.
+MODEL_VERSION = "v1"  # Nhãn kiến trúc; dùng Git tag/commit tương ứng khi thay đổi implementation.
+RUN_NAME = "pretrain_001"  # Run mới: <CHECKPOINT_DIR>/<MODEL_VERSION>/<RUN_NAME>/.
+INIT_CHECKPOINT = None  # Checkpoint nguồn để fine-tune; optimizer và tiến độ bắt đầu mới.
+RESUME_CHECKPOINT = None  # Resume run cũ theo cấu hình đã lưu; không dùng cùng INIT_CHECKPOINT.
+# Khi resume, DEVICE lấy từ config hiện tại; MODEL_VERSION/RUN_NAME không đổi nơi lưu của run cũ.
 # Step là số lần cập nhật optimizer thành công sau accumulation, không tính step bị AMP bỏ qua.
 # Đếm global step xuyên suốt các epoch và khôi phục từ checkpoint khi resume.
 SAVE_EVERY_STEPS = 1000  # Chu kỳ lưu checkpoint, tính bằng optimizer step.
 VAL_EVERY_STEPS = 1000  # Chu kỳ chạy validation, tính bằng optimizer step.
 LOG_EVERY_STEPS = 10  # Chu kỳ ghi log, tính bằng optimizer step.
+
+# ====================================================================================================
+# STAGE 2
+# ====================================================================================================
+
+# Bổ sung cấu hình riêng cho Stage 2 tại đây khi triển khai.
