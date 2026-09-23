@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -66,9 +67,10 @@ def build_cache(json_path, cache_path, chunk_size):
     tmp.rename(cache_path)
 
 class VLMDatasetStage1(Dataset):
-    def __init__(self, json_path, image_dir, is_training, cache_dir, chunk_size, transform):
+    def __init__(self, json_path, image_dir, is_training, cache_dir, chunk_size, transform, dataset_namespace):
         json_path = Path(json_path)
-        self.image_dir = Path(image_dir)
+        self.image_dir = Path(image_dir).resolve()
+        self.dataset_namespace = dataset_namespace
         self.is_training = is_training
         self.cache_path = Path(cache_dir) / ("train.sqlite" if is_training else "validation.sqlite")
         self.transform = transform
@@ -95,9 +97,13 @@ class VLMDatasetStage1(Dataset):
         if row is None:
             raise IndexError(idx)
         image_name, text = row
-        with Image.open(self.image_dir / image_name) as img:
+        image_path = (self.image_dir / image_name).resolve()
+        relative_path = image_path.relative_to(self.image_dir).as_posix()
+        key = f"{self.dataset_namespace}\0{relative_path}".encode("utf-8")
+        image_id = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big", signed=True)
+        with Image.open(image_path) as img:
             image = self.transform(img.convert("RGB"))
-        return image, text
+        return image, text, image_id
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -111,13 +117,14 @@ class VLMDataCollator:
         self.padding = padding
         self.truncation = truncation
     def __call__(self, batch):
-        images, texts = zip(*batch)
+        images, texts, image_ids = zip(*batch)
         tokens = self.tokenizer(
             texts, padding=self.padding, truncation=self.truncation,
             max_length=self.max_length, return_tensors="pt"
         )
         return {
             "images": torch.stack(images),
+            "image_ids": torch.tensor(image_ids, dtype=torch.long),
             "input_ids": tokens["input_ids"],
             "attention_mask": tokens["attention_mask"].bool()
         }
@@ -162,7 +169,7 @@ def main():
         is_training=cfg.IS_TRAINING,
         cache_dir=root / cfg.CACHE_DIR,
         chunk_size=cfg.CACHE_CHUNK_SIZE,
-        transform=transforms_aug,
+        transform=transforms_aug, dataset_namespace=cfg.DATASET_NAMESPACE,
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.TOKENIZER_MODEL_ID, use_fast=cfg.TOKENIZER_USE_FAST)
     if tokenizer.pad_token_id is None:

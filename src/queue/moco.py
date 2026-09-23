@@ -7,11 +7,12 @@ class MoCoQueue(nn.Module):
         self.capacity = capacity
         self.register_buffer("image", torch.zeros(capacity, num_queries, dim))
         self.register_buffer("text", torch.zeros(capacity, dim))
+        self.register_buffer("image_ids", torch.zeros(capacity, dtype=torch.long))
         self.register_buffer("ptr", torch.zeros((), dtype=torch.long))
         self.register_buffer("count", torch.zeros((), dtype=torch.long))
 
     @torch.no_grad()
-    def enqueue(self, images, texts):
+    def enqueue(self, images, texts, image_ids):
         b = images.size(0)
         n = min(b, self.capacity)
 
@@ -20,25 +21,24 @@ class MoCoQueue(nn.Module):
 
         self.image[idx] = images[-n:].detach()
         self.text[idx] = texts[-n:].detach()
+        self.image_ids[idx] = image_ids[-n:].detach()
         self.ptr.fill_((self.ptr.item() + b) % self.capacity)
         self.count.fill_(min(self.capacity, self.count.item() + b))
 
     def get(self):
         n = self.count.item()
         if n < self.capacity:
-            return self.image[:n], self.text[:n]
+            return self.image[:n], self.text[:n], self.image_ids[:n]
         idx = (
             torch.arange(self.capacity, device=self.image.device)
             + self.ptr
         ) % self.capacity
-        return self.image[idx], self.text[idx]
+        return self.image[idx], self.text[idx], self.image_ids[idx]
 
 def main():
     import torch
     import torch.nn.functional as F
-
     from src.utils.seed import seed_everything
-
     seed_everything()
 
     B = 4
@@ -69,7 +69,7 @@ def main():
     print("Current image:", image_1.shape)
     print("Current text :", text_1.shape)
 
-    image_q, text_q = queue.get()
+    image_q, text_q, image_ids_q = queue.get()
 
     print("Queue before enqueue")
     print("image queue:", image_q.shape)
@@ -77,9 +77,9 @@ def main():
     print("queue len  :", len(text_q))
 
     # Fill queue
-    queue.enqueue(image_1, text_1)
+    queue.enqueue(image_1, text_1, torch.arange(B, device=device))
 
-    image_q, text_q = queue.get()
+    image_q, text_q, image_ids_q = queue.get()
 
     print("\nQueue after enqueue")
     print("image queue:", image_q.shape)
@@ -102,7 +102,7 @@ def main():
         dim=-1
     )
 
-    image_q, text_q = queue.get()
+    image_q, text_q, image_ids_q = queue.get()
 
     print("\n\n=== ITERATION 2 ===")
     print("Current image:", image_2.shape)
@@ -215,9 +215,9 @@ def main():
     print("loss     :", loss.item())
 
     # Cuối iteration 2 mới enqueue batch mới
-    queue.enqueue(image_2, text_2)
+    queue.enqueue(image_2, text_2, torch.arange(B, 2 * B, device=device))
 
-    image_q, text_q = queue.get()
+    image_q, text_q, image_ids_q = queue.get()
 
     print("\n--- Queue after iteration 2 ---")
     print("image queue:", image_q.shape)
