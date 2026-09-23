@@ -146,9 +146,7 @@ class QFormer(nn.Module):
 
 def main():
     from transformers import AutoTokenizer, BertModel
-
     from src.utils.seed import seed_everything
-
     seed_everything()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
@@ -161,27 +159,22 @@ def main():
         cross_attn_every=2,
         hidden_dim=768,
     ).to(device)
-
     texts = [
         "A dog is running on the grass.",
         "A car is parked beside the road.",
         "Two people are sitting at a table.",
     ]
-
     tokens = tokenizer(
         texts,
         padding=True, truncation=True, max_length=128,
         return_tensors="pt"
     ).to(device)
-
     B = len(texts)
     image = torch.randn(B, 256, 1024, device=device)
-
     print("device:", device)
     print("input_ids:", tuple(tokens.input_ids.shape))
     print("image:", tuple(image.shape))
     print()
-
     model.eval()
     with torch.no_grad():
         text_embeddings = embeddings(input_ids=tokens.input_ids)
@@ -192,17 +185,14 @@ def main():
                 attn_mask=tokens.attention_mask.bool(),
                 objective=objective
             )
-
             print(f"[{objective.upper()}]")
             print("query :", tuple(out["query_output"].shape))
             print("text  :", tuple(out["text_output"].shape))
             print("hidden:", tuple(out["hidden_states"].shape))
             print()
-
     print(
         "params:",
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
     )
-
 if __name__ == "__main__":
     main()
