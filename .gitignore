@@ -44,4 +44,7 @@ venv/
 /cache
 /tests/*
 !/tests/test_checkpoint.py
+!/tests/test_losses.py
+!/tests/test_engine.py
+!/tests/test_image_ids.py
 /documents
