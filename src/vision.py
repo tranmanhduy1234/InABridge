@@ -1,16 +1,22 @@
 import torch
 import torch.nn as nn
-from transformers import DINOv3ViTModel
+from transformers import DINOv3ViTConfig, DINOv3ViTModel
 
 class ImageEncoder(nn.Module):
-    def __init__(self, return_layer, model_id, model_config=None):
+    def __init__(self, return_layer, model_id, model_config=None, mock=False):
         super().__init__()
         self.return_layer = return_layer
         self.model_id = model_id
-        self.model = (DINOv3ViTModel.from_pretrained(model_id) if model_config is None
-                      else DINOv3ViTModel(model_config))
+        if mock:
+            cfg = model_config if model_config is not None else DINOv3ViTConfig(hidden_size=1024, patch_size=16)
+            self.model = nn.Conv2d(cfg.num_channels, cfg.hidden_size, cfg.patch_size, stride=cfg.patch_size)
+            self.model.config = cfg
+        else:
+            self.model = (DINOv3ViTModel.from_pretrained(model_id) if model_config is None
+                          else DINOv3ViTModel(model_config))
         self.model.requires_grad_(False)
         self.model.eval()
+        self.mock = mock
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -40,6 +46,8 @@ class ImageEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        if self.mock:
+            return self.model(pixel_values).flatten(2).transpose(1, 2)
         outputs = self.model(pixel_values, output_hidden_states=True)
         features = outputs.hidden_states[self.return_layer]
         num_prefix_tokens = 1 + self.model.config.num_register_tokens
@@ -49,7 +57,7 @@ if __name__ == "__main__":
     from src.utils.seed import seed_everything
 
     seed_everything()
-    encoder = ImageEncoder(-1, "facebook/dinov3-vitl16-pretrain-lvd1689m").to("cuda")
+    encoder = ImageEncoder(-1, "facebook/dinov3-vitl16-pretrain-lvd1689m", mock=True).to("cuda")
     encoder.train()
     print("Compute grid shape: ", encoder.compute_grid_shape(512, 512))
     print("encoder training:", encoder.training)
