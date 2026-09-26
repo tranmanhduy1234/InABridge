@@ -59,10 +59,16 @@ class EngineTests(unittest.TestCase):
             losses, momentum = hepler_compute_loss(state, batch, .2)
         torch.testing.assert_close(sample.call_args_list[0].args[0], scores.softmax(-1))
         torch.testing.assert_close(sample.call_args_list[1].args[0], scores.T.softmax(-1))
-        itm_call = next(c for c in forward.call_args_list if c.args[-1] == 'itm')
-        self.assertEqual(itm_call.args[0].shape[0], 9)
-        self.assertTrue(torch.all(itm_call.args[1][6:, 1] != batch['input_ids'][:, 1]))
-        self.assertTrue(torch.all((itm_call.args[0][3:6] - features).flatten(1).abs().sum(1) > 0))
+        itm_calls = [c for c in forward.call_args_list if c.args[-1] == 'itm']
+        self.assertEqual(len(itm_calls), 3)
+        self.assertTrue(all(c.args[0].shape[0] == 3 for c in itm_calls))
+        self.assertTrue(torch.all(itm_calls[2].args[1][:, 1] != batch['input_ids'][:, 1]))
+        self.assertTrue(torch.all((itm_calls[1].args[0] - features).flatten(1).abs().sum(1) > 0))
+        with torch.no_grad():
+            logits = torch.cat([state.model(*c.args)['itm_logits'] for c in itm_calls])
+            labels = torch.tensor([1.] * 3 + [0.] * 6)
+            expected = state.criterion.get_itm_loss(logits, labels)['loss_itm']
+        torch.testing.assert_close(losses['loss_itm'], expected)
         torch.testing.assert_close(losses['loss'], losses['loss_itc'] + 2*losses['loss_itm'] + 3*losses['loss_itg'])
         losses['loss'].backward()
         self.assertTrue(state.model.itm_logit.weight.grad.isfinite().all())

@@ -14,6 +14,7 @@ from src import config
 ROOT = Path(__file__).resolve().parents[2]
 FORMAT_VERSION = 5
 
+
 def _architecture(model):
     def model_config(cfg):
         return {k: v for k, v in cfg.to_dict().items() if k not in {'transformers_version', '_name_or_path'}}
@@ -33,7 +34,7 @@ def _digest(value):
 
 
 def create_run(model, tokenizer, *, run_dir=None, settings=None, parent_checkpoint=None):
-    """Create a new run once; resume saves into the existing run directory."""
+    """Create a run directory and save its metadata."""
     if not tokenizer.is_fast:
         raise ValueError('A fast tokenizer is required for offline reconstruction')
     backend = json.loads(tokenizer.backend_tokenizer.to_str())
@@ -108,7 +109,6 @@ def save_checkpoint(run_dir, model, *, optimizer, scheduler, global_step, epoch,
                     torch=torch.get_rng_state(), cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []),
     }
     path = Path(run_dir) / filename
-    # A failed write leaves the previous checkpoint intact.
     with NamedTemporaryFile(dir=run_dir, suffix='.tmp', delete=False) as stream:
         temporary = Path(stream.name)
         try:
@@ -141,7 +141,7 @@ def _load_weights(model, weights):
 
 
 def load_pretrained(path):
-    """Load model/tokenizer offline; optimizer and progress are deliberately not restored."""
+    """Load the model and tokenizer offline for inference."""
     from tokenizers import AddedToken, Tokenizer
     from transformers import BertConfig, DINOv3ViTConfig, PreTrainedTokenizerFast
     from src.trainingph1.model import ModelStage1
@@ -167,7 +167,7 @@ def load_pretrained(path):
 
 
 def load_checkpoint(path, model, *, optimizer, scheduler, scaler=None, ema=None, queue=None):
-    """Resume pretrain or fine-tune; construct components from the saved run config first."""
+    """Restore training state into components built from the saved run config."""
     metadata, payload = _read(path)
     _check_model(metadata, model)
     objects = _components(optimizer, scheduler, scaler, ema, queue)

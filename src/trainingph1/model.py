@@ -31,7 +31,7 @@ class ModelStage1(nn.Module):
                  bert_config=None, vision_config=None):
         super().__init__()
         self.bert_name = bert_name
-        self.vision_encoder = ImageEncoder(return_layer, model_vision_id, vision_config)
+        self.vision_encoder = ImageEncoder(return_layer, model_vision_id, vision_config, mock=True)
         bert = (BertModel.from_pretrained(bert_name, add_pooling_layer=False) if bert_config is None
                 else BertModel(bert_config, add_pooling_layer=False))
         self.embeddings = bert.embeddings.requires_grad_(False).eval()

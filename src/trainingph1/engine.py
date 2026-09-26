@@ -215,14 +215,15 @@ def hepler_compute_loss(state, batch, pseudo_weight):
             similarity.masked_fill_(same_image, -torch.inf)
             negative_text = torch.multinomial(similarity.softmax(-1), 1).squeeze(1)
             negative_image = torch.multinomial(similarity.T.softmax(-1), 1).squeeze(1)
-        itm = model(
-            torch.cat((image_features, image_features[negative_image], image_features)),
-            torch.cat((input_ids, input_ids, input_ids[negative_text])),
-            torch.cat((attn_mask, attn_mask, attn_mask[negative_text])), "itm",
-        )
-        labels = torch.cat((torch.ones(batch_size, device=images.device, dtype=torch.long),
-                            torch.zeros(2 * batch_size, device=images.device, dtype=torch.long)))
-        losses.update(criterion.get_itm_loss(itm["itm_logits"], labels))
+        losses["loss_itm"] = 0
+        for features, tokens, mask, label in (
+            (image_features, input_ids, attn_mask, 1),
+            (image_features[negative_image], input_ids, attn_mask, 0),
+            (image_features, input_ids[negative_text], attn_mask[negative_text], 0),
+        ):
+            itm = model(features, tokens, mask, "itm")
+            labels = torch.full((batch_size,), label, device=images.device)
+            losses["loss_itm"] += criterion.get_itm_loss(itm["itm_logits"], labels)["loss_itm"] / 3
     else:
         # No negative exists when every caption belongs to the same image.
         losses["loss_itm"] = itc["loss_itc"] * 0
@@ -373,3 +374,6 @@ def run_training():
     for epoch in range(state.progress["epoch"], state.settings["EPOCHS"]):
         train_one_epoch(state, epoch)
     return state
+
+if __name__=="__main__":
+    run_training()
