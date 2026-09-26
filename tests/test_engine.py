@@ -1,4 +1,6 @@
 import copy
+import tempfile
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,7 +12,7 @@ from src import config
 from src.losses.lossph1 import Stage1Criterion
 from src.queue.ema import EMA
 from src.queue.moco import MoCoQueue
-from src.trainingph1.engine import hepler_compute_loss, train_one_epoch, run_training, validate
+from src.trainingph1.engine import hepler_compute_loss, train_one_epoch, run_training, validate, _training_events, get_data_fingerprints
 from src.trainingph1.model import ModelStage1
 
 
@@ -102,10 +104,14 @@ class EngineTests(unittest.TestCase):
     def test_run_training_updates_all_losses_ema_and_queue(self):
         state = self.state
         before = state.model.itc_encoder.query_proj.weight.detach().clone()
-        with patch('src.trainingph1.engine.prepare_training', return_value=state):
+        with patch('src.trainingph1.engine.prepare_training', return_value=state), \
+             patch('src.trainingph1.engine._save_state') as save, \
+             patch('src.trainingph1.engine.validate', return_value={'loss': 1.}):
             result = run_training()
         self.assertIs(result, state)
-        self.assertEqual(state.progress, dict(epoch=2, next_batch=0, global_step=4, data_state=None))
+        self.assertEqual(state.progress, dict(epoch=2, next_batch=0, global_step=4,
+                                            data_state={'last_validation_step': 4, 'best_val_loss': 1.}))
+        self.assertEqual(save.call_args.args, (state,))
         self.assertEqual(state.scheduler.last_epoch, 4)
         self.assertEqual(state.queue.count.item(), 10)
         self.assertFalse(torch.equal(before, state.model.itc_encoder.query_proj.weight))
@@ -131,6 +137,64 @@ class EngineTests(unittest.TestCase):
         for name, value in queue_before.items():
             torch.testing.assert_close(value, state.queue.state_dict()[name])
         self.assertEqual(validate(state), result)
+
+    def test_step_events_run_after_updates_and_skip_failed_steps(self):
+        state = self.state
+        state.settings.update(SAVE_EVERY_STEPS=1, VAL_EVERY_STEPS=1, LOG_EVERY_STEPS=1)
+        saved = []
+        def save(current, filename='last.pt'):
+            self.assertTrue(all(p.grad is None for p in current.model.parameters()))
+            self.assertEqual(current.scheduler.last_epoch, current.progress['global_step'])
+            saved.append((filename, current.progress['global_step'], current.progress['next_batch'],
+                          current.queue.count.item()))
+        with patch('src.trainingph1.engine._save_state', side_effect=save), \
+             patch('src.trainingph1.engine.validate', side_effect=[{'loss': 1.}, {'loss': 2.}]) as validation, \
+             patch('builtins.print') as log:
+            train_one_epoch(state, 0, on_step=_training_events)
+            _training_events(state, None, final=True)
+            self.assertEqual(saved, [('best.pt', 1, 2, 4), ('last.pt', 1, 2, 4),
+                                     ('last.pt', 2, 3, 5), ('last.pt', 2, 0, 5)])
+            self.assertEqual(validation.call_count, 2)
+            self.assertEqual(log.call_count, 4)
+            self.assertEqual(state.progress['data_state']['best_val_loss'], 1.)
+            hook = state.model.itc_encoder.query_proj.weight.register_hook(lambda grad: grad * float('inf'))
+            try:
+                train_one_epoch(state, 1, on_step=_training_events)
+            finally:
+                hook.remove()
+            self.assertEqual(len(saved), 4)
+            self.assertEqual(validation.call_count, 2)
+
+    def test_disabled_intervals_still_save_final_checkpoint(self):
+        self.state.settings.update(SAVE_EVERY_STEPS=0, VAL_EVERY_STEPS=0, LOG_EVERY_STEPS=0)
+        with patch('src.trainingph1.engine._save_state') as save, \
+             patch('src.trainingph1.engine.validate') as validation:
+            train_one_epoch(self.state, 0, on_step=_training_events)
+            save.assert_not_called()
+            _training_events(self.state, None, final=True)
+            save.assert_called_once_with(self.state)
+            validation.assert_not_called()
+
+    def test_data_fingerprints_detect_same_size_changes_and_ignore_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = dict(JSON_PATH_TRAIN=str(root / 'train.json'),
+                            JSON_PATH_VAL=str(root / 'val.json'), CACHE_DIR=str(root))
+            files = ['train.json', 'val.json', 'train.sqlite', 'validation.sqlite']
+            for name in files:
+                (root / name).write_bytes(b'original')
+            original = get_data_fingerprints(settings)
+            for name in files:
+                (root / name).write_bytes(b'modified')
+                self.assertNotEqual(get_data_fingerprints(settings), original)
+                (root / name).write_bytes(b'original')
+            moved = root / 'moved'
+            moved.mkdir()
+            for name in files:
+                (root / name).rename(moved / name)
+            relocated = {key: str(moved / Path(value).name) if key != 'CACHE_DIR' else str(moved)
+                         for key, value in settings.items()}
+            self.assertEqual(get_data_fingerprints(relocated), original)
 
     def test_validation_averages_by_samples_pairs_and_tokens(self):
         state = self.state

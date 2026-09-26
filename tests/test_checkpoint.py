@@ -16,7 +16,7 @@ from src import config
 from src.queue.ema import EMA
 from src.queue.moco import MoCoQueue
 from src.trainingph1.model import ModelStage1
-from src.trainingph1.engine import prepare_training, get_pseudo_weight
+from src.trainingph1.engine import prepare_training, get_pseudo_weight, run_training
 from src.utils.checkpoint import create_run, save_checkpoint, load_pretrained, load_checkpoint
 
 
@@ -140,6 +140,7 @@ class CheckpointTests(unittest.TestCase):
                         PSEUDO_WEIGHT=0.6, PSEUDO_WARMUP_EPOCHS=2, NUM_QUERIES=99, ITC_DIM=99)
         with patch.multiple(config, **settings), \
              patch('src.trainingph1.engine.get_dataloader', return_value=([0] * 4, [])), \
+             patch('src.trainingph1.engine.get_data_fingerprints', return_value={'train': 'original'}), \
              patch('transformers.BertModel.from_pretrained', side_effect=AssertionError('network')), \
              patch('transformers.DINOv3ViTModel.from_pretrained', side_effect=AssertionError('network')):
             state = prepare_training()
@@ -155,6 +156,17 @@ class CheckpointTests(unittest.TestCase):
                                 LR=0.5, EPOCHS=100, WARMUP_EPOCHS=10, ACCUMULATION_STEPS=1,
                                 MOMENTUM=0.1, QUEUE_SIZE=99, RUN_NAME='ignored', MODEL_VERSION='ignored'):
                 restored = prepare_training()
+            for fingerprints in ({'train': 'changed'}, {}):
+                with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path)), \
+                     patch('src.trainingph1.engine.get_data_fingerprints', return_value=fingerprints):
+                    with self.assertRaisesRegex(ValueError, 'fingerprint'):
+                        prepare_training()
+            model, tokenizer, saved = load_pretrained(path)
+            saved.pop('DATA_FINGERPRINTS')
+            with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path)), \
+                 patch('src.trainingph1.engine.load_pretrained', return_value=(model, tokenizer, saved)):
+                with self.assertRaisesRegex(ValueError, 'fingerprint is missing'):
+                    prepare_training()
             self.assertEqual(restored.run_dir, state.run_dir)
             self.assertEqual(restored.settings['LR'], 0.002)
             self.assertEqual(restored.progress['next_batch'], 1)
@@ -175,7 +187,8 @@ class CheckpointTests(unittest.TestCase):
                             DEVICE='cpu', AMP_ENABLED=False, QUEUE_SIZE=4), \
              patch('src.trainingph1.engine.get_model', return_value=(self.model, EMA(self.model.itc_encoder, 0.99))), \
              patch('src.trainingph1.engine.AutoTokenizer.from_pretrained', return_value=self.tokenizer), \
-             patch('src.trainingph1.engine.get_dataloader', return_value=([0] * 4, [])):
+             patch('src.trainingph1.engine.get_dataloader', return_value=([0] * 4, [])), \
+             patch('src.trainingph1.engine.get_data_fingerprints', return_value={'train': 'original'}):
             state = prepare_training()
             self.assertEqual(state.run_dir, self.root / 'v2' / 'pretrain')
             self.assertIsNone(json.loads((state.run_dir / 'run.json').read_text())['parent_checkpoint'])
@@ -185,6 +198,43 @@ class CheckpointTests(unittest.TestCase):
         with patch.multiple(config, INIT_CHECKPOINT='source.pt', RESUME_CHECKPOINT='last.pt'):
             with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
                 prepare_training()
+
+    def test_engine_periodic_checkpoint_resumes_mid_epoch_exactly(self):
+        ids = torch.tensor([[2, 3, 4], [2, 4, 3]])
+        batches = [dict(images=torch.randn(2, 3, 16, 16), input_ids=ids,
+                        attention_mask=torch.ones_like(ids, dtype=torch.bool), image_ids=torch.tensor([11, 22]))
+                   for _ in range(3)]
+        settings = dict(INIT_CHECKPOINT=str(self.path), RESUME_CHECKPOINT=None,
+                        CHECKPOINT_DIR=str(self.root), MODEL_VERSION='v1', RUN_NAME='baseline',
+                        DEVICE='cpu', AMP_ENABLED=False, EPOCHS=2, WARMUP_EPOCHS=0,
+                        ACCUMULATION_STEPS=2, QUEUE_SIZE=8, SAVE_EVERY_STEPS=1,
+                        VAL_EVERY_STEPS=1, LOG_EVERY_STEPS=0)
+        with patch.multiple(config, **settings), \
+             patch('src.trainingph1.engine.get_dataloader', return_value=(batches, batches)), \
+             patch('src.trainingph1.engine.get_data_fingerprints', return_value={'train': 'original'}), \
+             patch('builtins.print'):
+            baseline = run_training()
+            def interrupt_after_save(*args, **kwargs):
+                path = save_checkpoint(*args, **kwargs)
+                if kwargs['filename'] == 'last.pt':
+                    raise RuntimeError('interrupted')
+                return path
+            with patch.object(config, 'RUN_NAME', 'interrupted'), \
+                 patch('src.trainingph1.engine.save_checkpoint', side_effect=interrupt_after_save):
+                with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                    run_training()
+            path = self.root / 'v1' / 'interrupted' / 'last.pt'
+            payload = torch.load(path, weights_only=True)
+            self.assertEqual((payload['epoch'], payload['next_batch'], payload['global_step']), (0, 2, 1))
+            self.assertIn('best_val_loss', payload['data_state'])
+            with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path)):
+                restored = run_training()
+            self.assert_state_equal(baseline.model.state_dict(), restored.model.state_dict())
+            for name in ('optimizer', 'scheduler', 'ema', 'queue'):
+                self.assert_state_equal(getattr(baseline, name).state_dict(), getattr(restored, name).state_dict())
+            self.assertEqual(baseline.progress, restored.progress)
+            final = torch.load(path, weights_only=True)
+            self.assertEqual((final['epoch'], final['next_batch'], final['global_step']), (2, 0, 4))
 
     def test_rejects_wrong_run_architecture_and_missing_components(self):
         other = create_run(self.model, self.tokenizer, run_dir=self.root / 'other')

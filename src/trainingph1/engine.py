@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import math
 import random
+import hashlib
 from types import SimpleNamespace
 import numpy as np
 import torch
@@ -16,7 +17,7 @@ from src import config
 from src.trainingph1.model import ModelStage1
 from src.queue.ema import EMA
 from src.queue.moco import MoCoQueue
-from src.utils.checkpoint import create_run, load_pretrained, load_checkpoint
+from src.utils.checkpoint import create_run, save_checkpoint, load_pretrained, load_checkpoint
 from src.losses.lossph1 import Stage1Criterion
 from src.utils.seed import seed_everything
 
@@ -138,6 +139,18 @@ def get_scheduler(optimizer, warmup_steps=None, total_steps=None,
         return ratio + (1.0 - ratio) * cosine
     return LambdaLR(optimizer, [lambda step, ratio=ratio: lr_lambda(step, ratio) for ratio in ratios])
 
+def get_data_fingerprints(settings):
+    root = Path(__file__).resolve().parents[2]
+    paths = dict(train_manifest=root / settings["JSON_PATH_TRAIN"],
+                 val_manifest=root / settings["JSON_PATH_VAL"],
+                 train_cache=root / settings["CACHE_DIR"] / "train.sqlite",
+                 val_cache=root / settings["CACHE_DIR"] / "validation.sqlite")
+    fingerprints = {}
+    for name, path in paths.items():
+        with path.open("rb") as stream:
+            fingerprints[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return fingerprints
+
 def prepare_training():
     if config.INIT_CHECKPOINT and config.RESUME_CHECKPOINT:
         raise ValueError("INIT_CHECKPOINT and RESUME_CHECKPOINT are mutually exclusive")
@@ -156,12 +169,19 @@ def prepare_training():
     model = model.to(cfg.DEVICE).train()
     ema = (EMA(model.itc_encoder, cfg.MOMENTUM) if source else ema).to(cfg.DEVICE)
     train_loader, val_loader = get_dataloader(tokenizer, settings)
+    fingerprints = get_data_fingerprints(settings)
     if config.RESUME_CHECKPOINT:
+        if saved_settings.get("DATA_FINGERPRINTS") != fingerprints:
+            raise ValueError("Dataset manifest/cache changed or fingerprint is missing; use INIT_CHECKPOINT")
         if saved_settings.get("BATCHES_PER_EPOCH") != len(train_loader):
             raise ValueError("Resume requires the saved BATCHES_PER_EPOCH to match the training loader")
         if saved_settings.get("DATA_RNG_VERSION") != 1:
             raise ValueError("Checkpoint predates reproducible data iteration; use INIT_CHECKPOINT")
-    settings.update(BATCHES_PER_EPOCH=len(train_loader), DATA_RNG_VERSION=1)
+    settings.update(BATCHES_PER_EPOCH=len(train_loader), DATA_RNG_VERSION=1,
+                    DATA_FINGERPRINTS=fingerprints)
+    for name in ("SAVE_EVERY_STEPS", "VAL_EVERY_STEPS", "LOG_EVERY_STEPS"):
+        if type(settings[name]) is not int or settings[name] < 0:
+            raise ValueError(f"{name} must be a non-negative integer (0 disables it)")
     optimizer = get_optimizer(model, settings)
     scheduler = get_scheduler(optimizer, batches_per_epoch=len(train_loader), settings=settings)
     queue = get_queue(settings, model).to(cfg.DEVICE)
@@ -303,7 +323,7 @@ def _training_batches(loader, seed, start_batch):
             rng = _data_rng_state()
         yield batch
 
-def train_one_epoch(state, epoch):
+def train_one_epoch(state, epoch, on_step=None):
     cfg = SimpleNamespace(**state.settings)
     if cfg.ACCUMULATION_STEPS < 1:
         raise ValueError("ACCUMULATION_STEPS must be positive")
@@ -364,15 +384,47 @@ def train_one_epoch(state, epoch):
             )
             state.progress["global_step"] += 1
         state.progress.update(epoch=epoch, next_batch=group_start + len(group))
+        if updated and on_step is not None:
+            metrics = {name: totals[name] / max(counts[name], 1) for name in weights}
+            metrics["loss"] = sum(weights[name] * metrics[name] for name in weights)
+            on_step(state, metrics)
     state.progress.update(epoch=epoch + 1, next_batch=0)
     losses = {name: total / max(counts[name], 1) for name, total in totals.items()}
     losses["loss"] = sum(weights[name] * losses[name] for name in weights)
     return losses
 
+def _save_state(state, filename="last.pt"):
+    return save_checkpoint(state.run_dir, state.model, **state.progress, filename=filename,
+                           **{name: getattr(state, name) for name in
+                              ("optimizer", "scheduler", "scaler", "ema", "queue")})
+
+def _training_events(state, metrics, final=False):
+    step = state.progress["global_step"]
+    def due(name):
+        interval = state.settings[name]
+        return interval > 0 and step > 0 and step % interval == 0
+
+    if metrics is not None and due("LOG_EVERY_STEPS"):
+        print(f"step={step} train={metrics}", flush=True)
+    data_state = state.progress["data_state"] or {}
+    should_validate = (due("VAL_EVERY_STEPS") or (final and state.settings["VAL_EVERY_STEPS"] > 0))
+    should_validate = should_validate and data_state.get("last_validation_step") != step
+    if should_validate:
+        metrics = validate(state)
+        print(f"step={step} validation={metrics}", flush=True)
+        data_state["last_validation_step"] = step
+        state.progress["data_state"] = data_state
+        if math.isfinite(metrics["loss"]) and metrics["loss"] < data_state.get("best_val_loss", math.inf):
+            data_state["best_val_loss"] = metrics["loss"]
+            _save_state(state, "best.pt")
+    if final or due("SAVE_EVERY_STEPS") or should_validate:
+        _save_state(state)
+
 def run_training():
     state = prepare_training()
     for epoch in range(state.progress["epoch"], state.settings["EPOCHS"]):
-        train_one_epoch(state, epoch)
+        train_one_epoch(state, epoch, on_step=_training_events)
+    _training_events(state, None, final=True)
     return state
 
 if __name__=="__main__":

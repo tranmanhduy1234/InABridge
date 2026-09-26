@@ -103,9 +103,9 @@ RESUME_CHECKPOINT = None  # Resume run cũ theo cấu hình đã lưu; không d�
 # Khi resume, DEVICE lấy từ config hiện tại; MODEL_VERSION/RUN_NAME không đổi nơi lưu của run cũ.
 # Step là số lần cập nhật optimizer thành công sau accumulation, không tính step bị AMP bỏ qua.
 # Đếm global step xuyên suốt các epoch và khôi phục từ checkpoint khi resume.
-SAVE_EVERY_STEPS = 1000  # Chu kỳ lưu checkpoint, tính bằng optimizer step.
-VAL_EVERY_STEPS = 1000  # Chu kỳ chạy validation, tính bằng optimizer step.
-LOG_EVERY_STEPS = 10  # Chu kỳ ghi log, tính bằng optimizer step.
+SAVE_EVERY_STEPS = 1000  # Chu kỳ lưu last.pt theo optimizer step; 0 tắt lịch, vẫn lưu cuối training.
+VAL_EVERY_STEPS = 1000  # Chu kỳ validation và chọn best.pt; 0 tắt, nếu bật chạy thêm cuối training.
+LOG_EVERY_STEPS = 10  # Chu kỳ in loss training ra stdout theo optimizer step; 0 tắt.
 
 # ====================================================================================================
 # STAGE 2

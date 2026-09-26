@@ -403,7 +403,7 @@ from src.trainingph1.engine import run_training
 state = run_training()
 ```
 
-Hàm này chưa gọi validation hoặc tự lưu checkpoint. Nếu cần lưu kết quả cuối, gọi `save_checkpoint()` với state trả về như ví dụ trên. Không gọi thêm `prepare_training()` trước `run_training()` vì hàm đã tự chuẩn bị run.
+Hàm tự lưu `last.pt` theo `SAVE_EVERY_STEPS`, gọi validation theo `VAL_EVERY_STEPS` và in loss training ra stdout theo `LOG_EVERY_STEPS`. Các chu kỳ tính theo optimizer step thành công; đặt `0` để tắt từng lịch. Khi validation loss hữu hạn và thấp hơn mức tốt nhất, engine lưu `best.pt`; giá trị tốt nhất và step validation được giữ trong `data_state` để resume. Mỗi lần validation cũng cập nhật `last.pt`. Cuối training luôn lưu `last.pt` và chạy validation nếu bật, trừ khi step đó đã được đánh giá. Log training là loss trung bình từ đầu phần epoch đang chạy. Không gọi thêm `prepare_training()` trước `run_training()` vì hàm đã tự chuẩn bị run.
 
 Validation có thể gọi riêng:
 
@@ -413,7 +413,7 @@ from src.trainingph1.engine import validate
 losses = validate(state)
 ```
 
-ITC lấy trung bình theo số mẫu, ITM theo số cặp có negative hợp lệ, ITG theo số token không padding. `loss` là tổng ba giá trị trung bình đã nhân trọng số. Nhánh không có phần tử hợp lệ trả 0; loader rỗng báo lỗi. Mặc định pseudo weight cố định bằng `state.settings["PSEUDO_WEIGHT"]`, có thể truyền giá trị khác qua `pseudo_weight`. Validation dùng queue hiện tại để đọc và dùng hard-negative sampling trong batch; không enqueue hoặc cập nhật EMA/optimizer. Hàm tắt gradient, bật eval, khôi phục chế độ model và Torch RNG sau khi chạy. Kết quả ITC vẫn phụ thuộc queue hiện tại. `run_training()` chưa tự gọi validation.
+ITC lấy trung bình theo số mẫu, ITM theo số cặp có negative hợp lệ, ITG theo số token không padding. `loss` là tổng ba giá trị trung bình đã nhân trọng số. Nhánh không có phần tử hợp lệ trả 0; loader rỗng báo lỗi. Mặc định pseudo weight cố định bằng `state.settings["PSEUDO_WEIGHT"]`, có thể truyền giá trị khác qua `pseudo_weight`. Validation dùng queue hiện tại để đọc và dùng hard-negative sampling trong batch; không enqueue hoặc cập nhật EMA/optimizer. Hàm tắt gradient, bật eval, khôi phục chế độ model và Torch RNG sau khi chạy. Kết quả ITC vẫn phụ thuộc queue hiện tại.
 
 ### Resume và điều kiện lưu
 
@@ -426,6 +426,8 @@ Checkpoint khôi phục optimizer/scheduler, AMP scaler nếu có, EMA cùng mom
 - Dựng lại cùng lịch scheduler khi resume: `LambdaLR.state_dict()` không lưu nội dung hàm lambda.
 
 Loader kiểm tra kiến trúc, danh sách trainable, tên/kích thước trọng số, nhóm tham số optimizer và tập hợp/loại component được resume. **Không khóa augmentation, đường dẫn dữ liệu, hash mã nguồn hoặc phiên bản thư viện.** Config snapshot dùng để tham khảo và dựng lại training, không phải điều kiện bắt buộc mọi biến phải bằng nhau.
+
+Engine lưu SHA-256 nội dung hai manifest và hai SQLite cache trong `DATA_FINGERPRINTS` của config snapshot. Khi resume, fingerprint và số batch phải khớp; thay đổi nội dung hoặc thứ tự dữ liệu vẫn bị phát hiện dù số batch không đổi. Run cũ thiếu fingerprint phải dùng `INIT_CHECKPOINT` để bắt đầu run mới. Fingerprint không phụ thuộc đường dẫn tuyệt đối và không băm nội dung từng file ảnh; cần giữ nguyên ảnh khi resume. Việc đổi manifest cho run mới vẫn cần đổi/xóa cache cũ như hướng dẫn dataloader.
 
 Ghi checkpoint dùng file tạm rồi thay thế file đích; nếu ghi lỗi, bản `last.pt` trước đó còn nguyên. API chỉ tạo `last.pt` và `best.pt`, không tích lũy một file cho mỗi step. Format 5 lưu thêm queue image IDs và namespace trong config snapshot. Checkpoint format 4 bị từ chối; chưa có chuyển đổi tự động. Giữ nguyên namespace và cấu trúc đường dẫn tương đối khi tiếp tục dùng queue đã lưu.
 
@@ -480,9 +482,7 @@ Demo model/Q-Former cần tải hoặc có sẵn pretrained weights. Một số 
 
 | Phần | Công việc còn thiếu |
 | --- | --- |
-| Engine | Lịch gọi validation trong training |
 | Data resume | Khôi phục chính xác sampler/augmentation giữa epoch; hiện chỉ bỏ qua batch trước `next_batch` |
-| Checkpoint integration | Gọi save trong vòng lặp, quản lý tiến độ dữ liệu và lựa chọn best checkpoint |
 | Fine-tune | Entry point trong `trainingph1/finetune.py` |
 | Logging/artifacts | Logger, TensorBoard và ghi kết quả |
 | LLM integration | Nối projector với LLM và pipeline cho giai đoạn tiếp theo |
