@@ -37,7 +37,7 @@ CACHE_DIR = "cache/dataloader_demo"  # Ví dụ: "cache/train"; thư mục SQLit
 CACHE_CHUNK_SIZE = 1000  # Ví dụ: 1000; số bản ghi mỗi lần ghi metadata vào SQLite.
 
 IMAGE_SIZE = 640  # Ví dụ: 640; chiều cao và rộng ảnh đầu ra, tính bằng pixel.
-NORMALIZATION = None  # (mean, std) theo RGB; None bỏ chuẩn hóa, không tự lấy từ vision encoder.
+NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))  # (mean, std) RGB theo DINOv3.
 CROP_SCALE = (0.85, 1.0)  # Ví dụ: (0.85, 1.0); khoảng tỷ lệ diện tích crop so với ảnh gốc.
 CROP_RATIO = (0.9, 1.1)  # Ví dụ: (0.9, 1.1); khoảng tỷ lệ chiều rộng/chiều cao của crop.
 INTERPOLATION = "bicubic"  # Ví dụ: "bicubic"; phương pháp nội suy khi resize ảnh.

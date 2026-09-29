@@ -35,6 +35,10 @@ class ModelStage1(nn.Module):
         bert = (BertModel.from_pretrained(bert_name, add_pooling_layer=False) if bert_config is None
                 else BertModel(bert_config, add_pooling_layer=False))
         self.embeddings = bert.embeddings.requires_grad_(False).eval()
+
+        self.dec_embedding = nn.Parameter(torch.empty(hidden_dim))
+        nn.init.normal_(self.dec_embedding, std=bert.config.initializer_range)
+
         qformer = QFormer(
             bert=bert,
             num_queries=num_queries,
@@ -59,19 +63,32 @@ class ModelStage1(nn.Module):
     def encode_text(self, input_ids):
         return self.embeddings(input_ids=input_ids)
 
+    def replace_cls_with_dec(self, text_embeddings):
+        dec = self.dec_embedding.view(1, 1, -1).expand(text_embeddings.size(0), 1, -1)
+        return torch.cat([dec, text_embeddings[:, 1:]], dim=1)
+
     def train(self, mode=True):
         super().train(mode)
         self.embeddings.eval()
         self.lm_head.eval()
         return self
 
+    # DEC is a learned start embedding for generation.
+    # The tokenizer still emits [CLS], but for ITG/inference position 0 must be replaced
+    # with dec_embedding before entering the Q-Former. This also applies to later stages.
+
     def forward(self, image_features, input_ids, attn_mask, objective):
         objective = objective.lower()
         if objective not in {"itc", "itm", "itg"}:
             raise ValueError("objective must be itc, itm or itg")
         text_embeddings = self.encode_text(input_ids)
+
+        if objective == "itg":
+            text_embeddings = self.replace_cls_with_dec(text_embeddings)
+
         if objective == "itc":
             return self.itc_encoder(image_features, text_embeddings, attn_mask)
+
         out = self.qformer_model(image_features, text_embeddings, attn_mask, objective)
         if objective == "itm":
             return {"itm_logits": self.itm_logit(out["query_output"]).mean(1).squeeze(-1)}
