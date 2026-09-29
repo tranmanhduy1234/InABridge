@@ -22,15 +22,12 @@ class ImageEncoder(nn.Module):
         super().train(mode)
         self.model.eval()
         return self
-
     @property
     def hidden_size(self) -> int:
         return self.model.config.hidden_size
-
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
-
     def compute_grid_shape(self, height: int, width: int) -> tuple[int, int]:
         patch_size = self.model.config.patch_size
         if height <= 0 or width <= 0 or height % patch_size != 0 or width % patch_size != 0:
@@ -39,7 +36,6 @@ class ImageEncoder(nn.Module):
                 f"and divisible by {patch_size}."
             )
         return height // patch_size, width // patch_size
-
     def count_parameters(self, trainable: bool = False) -> int:
         return sum(p.numel() for p in self.model.parameters()) if not trainable \
             else sum(p.numel() for p in self.model.parameters() if p.requires_grad)
