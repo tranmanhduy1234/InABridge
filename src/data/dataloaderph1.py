@@ -5,13 +5,15 @@ from pathlib import Path
 import ijson
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import  DataLoader, Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import AutoTokenizer
 
 from src import config as cfg
 from src.utils.seed import seed_everything, seed_worker
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 def build_transform(image_size, is_training, normalization,
                     crop_scale, crop_ratio, interpolation,
@@ -36,35 +38,40 @@ def build_transform(image_size, is_training, normalization,
     return transforms.Compose(aug)
 
 def build_cache(json_path, cache_path, chunk_size):
-    if cache_path.exists():
-        return
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(".tmp")
-    if tmp.exists():
-        tmp.unlink()
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dis.get_rank() if distributed else 0
 
-    conn = sqlite3.connect(tmp)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    conn.execute("""
-        CREATE TABLE samples (
-            id INTEGER PRIMARY KEY,
-            image_name TEXT NOT NULL,
-            text TEXT NOT NULL
-        )
-    """)
-    with open(json_path, "rb") as f:
-        rows = []
-        for i, x in enumerate(ijson.items(f, "item")):
-            rows.append((i, x["image_name"], x["text"]))
-            if len(rows) >= chunk_size:
-                conn.executemany("INSERT INTO samples VALUES (?, ?, ?)", rows)
-                rows.clear()
-        if rows:
-            conn.executemany("INSERT INTO samples VALUES (?, ?, ?)", rows)
-    conn.commit()
-    conn.close()
-    tmp.rename(cache_path)
+    if rank == 0 and not cache_path.exists():
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        if tmp.exists():
+            tmp.unlink()
+
+            conn = sqlite3.connect(tmp)
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("""
+                CREATE TABLE samples (
+                    id INTEGER PRIMARY KEY,
+                    image_name TEXT NOT NULL,
+                    text TEXT NOT NULL
+                )
+            """)
+            with open(json_path, "rb") as f:
+                rows = []
+                for i, x in enumerate(ijson.items(f, "item")):
+                    rows.append((i, x["image_name"], x["text"]))
+                    if len(rows) >= chunk_size:
+                        conn.executemany("INSERT INTO samples VALUES (?, ?, ?)", rows)
+                        rows.clear()
+
+                if rows:
+                    conn.executemany("INSERT INTO samples VALUES (?, ?, ?)", rows)
+            conn.commit()
+            conn.close()
+            tmp.rename(cache_path)
+        if distributed:
+            dist.barrier()
 
 class VLMDatasetStage1(Dataset):
     def __init__(self, json_path, image_dir, is_training, cache_dir, chunk_size, transform, dataset_namespace):
@@ -76,7 +83,6 @@ class VLMDatasetStage1(Dataset):
         self.transform = transform
         self.conn = None
         build_cache(json_path=json_path, cache_path=self.cache_path, chunk_size=chunk_size)
-
         with sqlite3.connect(self.cache_path) as conn:
             self.length = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
 
@@ -131,16 +137,42 @@ class VLMDataCollator:
 
 def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
                      drop_last, shuffle, pin_memory, persistent_workers,
-                     prefetch_factor, collate_fn):
+                     prefetch_factor, collate_fn, distributed=False):
+
+    shuffle = dataset.is_training if shuffle is None else shuffle
+
+    sampler = None
+    if distributed:
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "distributed=True requires dist.init_process_group() first"
+            )
+
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=shuffle if dataset.is_training else False,
+            drop_last=drop_last if dataset.is_training else False,
+        )
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    generator = torch.Generator()
+    generator.manual_seed(rank)
     kwargs = dict(
-        dataset=dataset, batch_size=batch_size, shuffle=dataset.is_training if shuffle is None else shuffle,
-        drop_last=drop_last if dataset.is_training else False, num_workers=num_workers,
+        dataset=dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=shuffle if sampler is None else False,
+        drop_last=drop_last if dataset.is_training else False,
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available() if pin_memory is None else pin_memory,
         persistent_workers=persistent_workers and num_workers > 0,
-        collate_fn=collate_fn, worker_init_fn=seed_worker
+        collate_fn=collate_fn,
+        worker_init_fn=seed_worker,
+        generator=generator
     )
+
     if num_workers > 0:
         kwargs["prefetch_factor"] = prefetch_factor
+
     return DataLoader(**kwargs)
 
 def main():
