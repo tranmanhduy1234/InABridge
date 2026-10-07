@@ -35,6 +35,8 @@ IMAGE_DIR = "DatasetProject/BLIP3o/Image"  # Ví dụ: "data/images"; thư mục
 JSON_PATH_VAL = "DatasetProject/BLIP3o/dataset_metadata.json"  # Ví dụ: "data/validation.json"; manifest validation, dùng tập riêng khi đánh giá mô hình.
 CACHE_DIR = "cache/dataloader_demo"  # Ví dụ: "cache/train"; thư mục SQLite cache, cần đổi hoặc xóa cache khi đổi manifest.
 CACHE_CHUNK_SIZE = 1000  # Ví dụ: 1000; số bản ghi mỗi lần ghi metadata vào SQLite.
+LENGTH_JITTER = 4
+LENGTH_MEGA_BATCH_MULT = 32
 
 IMAGE_SIZE = 640  # Ví dụ: 640; chiều cao và rộng ảnh đầu ra, tính bằng pixel.
 NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))  # (mean, std) RGB theo DINOv3.
@@ -57,8 +59,8 @@ TOKENIZER_TRUNCATION = True  # Ví dụ: True; cắt văn bản vượt quá MAX
 
 BATCH_SIZE = 8  # Ví dụ: 8; số mẫu mỗi batch, cần ít nhất 2 cho hard negative sampling.
 NUM_WORKERS = 0  # Ví dụ: 4; số worker đọc dữ liệu, 0 để chạy trong tiến trình chính.
-DROP_LAST = False  # Ví dụ: True; bỏ batch cuối thiếu mẫu khi train, validation luôn giữ.
-SHUFFLE = False  # Ví dụ: None; None tự bật theo IS_TRAINING, True/False để chỉ định trực tiếp.
+DROP_LAST = True  # Ví dụ: True; bỏ batch cuối thiếu mẫu khi train, validation luôn giữ.
+SHUFFLE = True  # Ví dụ: None; None tự bật theo IS_TRAINING, True/False để chỉ định trực tiếp.
 PIN_MEMORY = False  # Ví dụ: None; None tự bật khi có CUDA, True/False để chỉ định trực tiếp.
 PERSISTENT_WORKERS = False  # Ví dụ: True; giữ worker giữa các lượt duyệt dữ liệu, chỉ áp dụng khi NUM_WORKERS > 0.
 PREFETCH_FACTOR = 2  # Ví dụ: 2; số batch mỗi worker nạp trước, chỉ áp dụng khi NUM_WORKERS > 0.

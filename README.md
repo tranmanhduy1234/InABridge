@@ -2,7 +2,7 @@
 
 InA-Bridge xây dựng mô hình thị giác–ngôn ngữ (VLM) với **DINOv3 + Q-Former khởi tạo từ BERT**. Giai đoạn 1 học biểu diễn ảnh–văn bản qua ba mục tiêu: image-text contrastive (ITC), image-text matching (ITM) và image-grounded text generation (ITG).
 
-Repository hiện có model, xử lý dữ liệu, ba loss ITC/ITM/ITG, quản lý checkpoint và khung training. **Lịch validation, logging và lưu checkpoint tự động trong vòng lặp chưa được triển khai.** README mô tả mã hiện có; các phần chưa triển khai được đánh dấu riêng.
+Repository hiện có model, ba loss ITC/ITM/ITG và vòng lặp training với lịch validation/logging/checkpoint. **Dataloader multilevel đã được kiểm chứng riêng, chưa nối vào engine.** Engine hiện dùng loader cũ; distributed training FSDP/ZeRO-3 vẫn là [kế hoạch triển khai](FSDP/fsdp_strategy.md).
 
 ## 1. Cấu trúc thư mục
 
@@ -16,15 +16,16 @@ InA-Bridge/
 │   ├── qformer.py                 # Query tokens, attention masks và Q-Former blocks
 │   ├── projector.py               # QwenProjector, chưa nối vào pipeline
 │   ├── data/
-│   │   └── dataloaderph1.py        # JSON → SQLite cache → ảnh/text → batch tensor
+│   │   ├── dataloaderph1.py        # Loader cũ, engine hiện vẫn sử dụng
+│   │   └── dataloaderph1_multilevel.py # Length-aware batching, chia rank và padding mask
 │   ├── losses/
-│   │   └── lossph1.py             # Stage1Criterion: hiện có loss ITC
+│   │   └── lossph1.py             # Stage1Criterion: ITC/ITM/ITG
 │   ├── queue/
 │   │   ├── ema.py                 # Momentum model, cập nhật bằng EMA
 │   │   └── moco.py                # Queue vòng lưu image/text features
 │   ├── trainingph1/
 │   │   ├── model.py               # ModelStage1 và các nhánh ITC/ITM/ITG
-│   │   ├── engine.py              # Các hàm khởi tạo; vòng lặp train còn thiếu
+│   │   ├── engine.py              # Khởi tạo, train/validation và lịch sự kiện
 │   │   └── finetune.py            # File trống, chưa triển khai
 │   ├── utils/
 │   │   ├── checkpoint.py          # Tạo run, lưu, nạp model và resume training
@@ -36,6 +37,7 @@ InA-Bridge/
 │       └── stage1/
 │           └── manager.json       # Tài liệu quy ước checkpoint format 5
 ├── tests/
+│   ├── test_dataloaderph1_multilevel.py # Cache, sampler, masks, workers và Gloo
 │   └── test_checkpoint.py         # Kiểm thử checkpoint bằng model nhỏ trên CPU
 ├── DatasetProject/                # Dữ liệu cục bộ, không đưa vào Git
 ├── cache/                         # SQLite cache cục bộ, không đưa vào Git
@@ -135,20 +137,22 @@ Trong implementation hiện tại, RMSNorm dùng `hidden_dim` trực tiếp trê
 
 `image_name` được nối với `IMAGE_DIR`. Đường dẫn manifest, ảnh và cache trong engine có thể là đường dẫn tuyệt đối hoặc tương đối từ gốc dự án.
 
-### Các thành phần trong `src/data/dataloaderph1.py`
+### Dataloader multilevel
+
+[src/data/dataloaderph1_multilevel.py](src/data/dataloaderph1_multilevel.py) dùng một batch sampler chung cho training và validation. Module đã sẵn sàng để tích hợp; `engine.py` hiện vẫn import `dataloaderph1.py` và chưa sử dụng `valid_mask`.
 
 | Thành phần | Trách nhiệm |
 | --- | --- |
-| `build_cache()` | Đọc JSON theo luồng bằng `ijson`, ghi metadata theo chunk vào SQLite |
-| `VLMDatasetStage1` | Đọc một bản ghi từ cache, mở ảnh RGB, áp dụng transform, trả `(image, text, image_id)` |
-| `build_transform()` | Dựng augmentation train hoặc resize validation, chuyển tensor và normalization tùy cấu hình |
-| `VLMDataCollator` | Tokenize một batch text, padding/truncation và ghép ảnh thành tensor |
-| `build_dataloader()` | Cấu hình batch, shuffle, worker, pin memory, prefetch và seed worker |
-| `main()` | Demo đọc batch và hiển thị ảnh/caption |
+| `build_cache()` | Đọc JSON theo luồng, lưu metadata và token length đã truncation vào SQLite |
+| `VLMDatasetStage1` | Đọc ảnh/text, áp dụng transform, tạo image ID; chuyển cờ hợp lệ từ sampler tới collator |
+| `VLMDataCollator` | Tokenize, padding/truncation text, ghép ảnh và tạo `valid_mask` |
+| `MultiLevelLengthBatchSampler` | Group theo độ dài khi bật length-aware, shuffle, chia batch theo rank và đánh dấu slots đệm |
+| `build_dataloader()` | Dựng sampler/loader, seed generator theo rank và kiểm tra loader rỗng |
+| `set_dataloader_epoch()` | Đặt epoch cho batch sampler trước khi tạo iterator |
 
-Training dùng random resized crop, horizontal flip, color jitter, grayscale và Gaussian blur theo xác suất cấu hình. Validation chỉ resize trước khi chuyển tensor và normalization. `NORMALIZATION=None` nghĩa là bỏ chuẩn hóa; code không tự lấy mean/std từ vision encoder.
+Training dùng random resized crop, horizontal flip, color jitter, grayscale và Gaussian blur. Validation chỉ resize trước khi chuyển tensor và normalization. `NORMALIZATION=None` bỏ chuẩn hóa; code không tự lấy mean/std từ vision encoder.
 
-Collator trả:
+### Batch trả về
 
 | Key | Shape / kiểu |
 | --- | --- |
@@ -156,14 +160,63 @@ Collator trả:
 | `image_ids` | `[B]`, `torch.long`; ID ảnh ổn định |
 | `input_ids` | `[B, T]`, token IDs |
 | `attention_mask` | `[B, T]`, boolean; `True` là token hợp lệ |
+| `valid_mask` | `[B]`, boolean; `True` là mẫu thật, `False` là slot đệm |
 
-`DATASET_NAMESPACE` trong `config.py` định danh nguồn dữ liệu. Image ID dùng BLAKE2b 8 byte của `namespace + "\0" + relative_path`, chuyển thành signed int64. Đường dẫn được resolve rồi lấy tương đối với `IMAGE_DIR`, dùng dấu `/`; ảnh phải nằm trong thư mục gốc này. Cùng namespace và đường dẫn tương đối sẽ giữ ID khi chuyển dataset sang máy/thư mục khác. Dùng cùng namespace cho train/validation nếu cùng nguồn ảnh; đổi namespace cho dataset khác. ID nhận diện đường dẫn, không nhận diện ảnh trùng nội dung ở hai đường dẫn khác nhau. Hash 64-bit có xác suất collision rất nhỏ, không bảo đảm duy nhất tuyệt đối.
+`attention_mask` loại token padding trong câu. `valid_mask` loại sample padding được thêm để cân bằng các rank. Mẫu đệm đọc lại ảnh/text thật nhưng mang cờ `False`; không deduplicate theo `image_ids` vì nhiều caption của cùng ảnh vẫn hợp lệ.
 
-Cache được đặt tên `train.sqlite` và `validation.sqlite`, chỉ chứa metadata, không chứa ảnh đã decode. Cache đã tồn tại sẽ được dùng lại; khi đổi manifest cần dùng thư mục cache khác hoặc chủ động xóa cache cũ.
+Image ID dùng BLAKE2b 8 byte của `DATASET_NAMESPACE + "\0" + relative_path`, chuyển thành signed int64. Ảnh phải nằm trong `IMAGE_DIR`; cùng namespace và đường dẫn tương đối giữ ID khi chuyển dataset sang thư mục khác. ID nhận diện đường dẫn, không nhận diện ảnh trùng nội dung.
 
-`get_dataloader()` trong engine luôn tạo cả train và validation loader. Validation không shuffle và giữ batch cuối. `PERSISTENT_WORKERS` và `PREFETCH_FACTOR` chỉ có tác dụng khi `NUM_WORKERS > 0`.
+### Batch size, grouping và padding
 
-Hiện `JSON_PATH_TRAIN` và `JSON_PATH_VAL` trỏ cùng một manifest demo; code **không tự chia tập**. Cần cấu hình hai manifest riêng để đánh giá trên tập validation độc lập.
+**`batch_size` là số mẫu trên mỗi GPU/rank**, không phải global batch size và không cần chia hết cho số GPU. Với `W` rank, một lượt có `batch_size * W` slots; số mẫu thật có thể ít hơn khi có padding.
+
+Training length-aware shuffle indices, group trong từng cửa sổ `batch_size * mega_batch_mult` theo token length có jitter, rồi shuffle samples/batches. `length_aware=False` bỏ bước group theo độ dài. Validation không shuffle hoặc group theo độ dài.
+
+| Chế độ | Xử lý phần dư |
+| --- | --- |
+| Training distributed, `drop_last=True` | Bỏ phần dư để mọi rank có cùng số batch đầy đủ; mask toàn `True` |
+| Training distributed, `drop_last=False` | Giữ mọi mẫu thật đúng một lần mỗi epoch; đệm đủ batch trên mọi rank, mask phần đệm bằng `False` |
+| Validation distributed | Luôn giữ mọi mẫu thật và đệm đủ batch, kể cả rank chỉ có padding |
+| Single-process, `drop_last=False` | Giữ batch cuối ngắn; không thêm sample padding, mask toàn `True` |
+
+Ví dụ **19 mẫu, 2 GPU, batch 4/GPU, `drop_last=False`**: mỗi rank có 3 batch, tổng 24 slots gồm 19 mẫu thật và 5 đệm. Padding có thể nằm trong batch đã shuffle, không nhất thiết chỉ ở lượt cuối. Dataset hoặc loader không có batch sẽ báo lỗi.
+
+Cấu hình hiện đặt `DROP_LAST=True`. Muốn training giữ toàn bộ mẫu, truyền `drop_last=False`. Dataloader chỉ đánh dấu padding: bên nhận batch phải dùng mask để loại slots đệm khỏi loss/counts, ITC candidates, ITM negatives, metrics và MoCo enqueue. Rank chỉ có padding vẫn cần tham gia lịch forward/collective; engine/loss chưa triển khai phần này.
+
+### Cache và điều kiện distributed
+
+Cache multilevel có tên `<namespace>_train.sqlite` và `<namespace>_validation.sqlite` (namespace được làm sạch để dùng trong tên file). Cache chứa metadata và token lengths, không chứa ảnh decode. Cache được xây lại nếu schema/signature không khớp; signature gồm đường dẫn/kích thước/mtime của manifest, tên tokenizer và `max_length`. `load_token_lengths()` dùng int64.
+
+- Truyền cùng tokenizer và `max_length` cho dataset/collator để grouping khớp tokenization; cache lengths được tính với truncation bật.
+- Khởi tạo process group và chọn device trước khi tạo dataset/loader với `distributed=True`; module không tự init và sẽ báo lỗi nếu group chưa sẵn sàng.
+- Mọi rank dùng cùng dữ liệu, lengths, sampler config, seed và epoch. Baseline yêu cầu cùng đường dẫn cache; rank 0 tạo cache, các rank đợi barrier.
+- Gọi `set_dataloader_epoch(loader, epoch)` trước mỗi iterator. Sampler dùng `seed + epoch`; loader generator khởi tạo bằng `seed + rank`.
+- `persistent_workers` và `prefetch_factor` chỉ áp dụng khi `num_workers > 0`.
+
+Sau khi đã tạo `dataset` và `tokenizer` phù hợp, có thể dựng loader như sau (`distributed=True` yêu cầu process group đã init):
+
+```python
+from src.data.dataloaderph1_multilevel import (
+    VLMDataCollator, build_dataloader, set_dataloader_epoch,
+)
+
+loader = build_dataloader(
+    dataset=dataset, batch_size=4, num_workers=2,
+    drop_last=False, shuffle=dataset.is_training,
+    pin_memory=True, persistent_workers=False, prefetch_factor=2,
+    collate_fn=VLMDataCollator(tokenizer, max_length=128),
+    distributed=True, length_aware=True,
+    mega_batch_mult=32, length_jitter=4, seed=42,
+)
+for epoch in range(epochs):
+    set_dataloader_epoch(loader, epoch)
+    for batch in loader:
+        valid_mask = batch["valid_mask"]  # Truyền cùng batch tới loss/metrics/queue.
+```
+
+`VLMDatasetStage1` cần thêm `tokenizer`, `max_length` và `distributed` khi khởi tạo; chỉ đổi import trong engine là chưa đủ. Module cung cấp batch đúng cấu trúc, không tự quản lý loss, model sharding hay checkpoint.
+
+Hiện `JSON_PATH_TRAIN` và `JSON_PATH_VAL` trỏ cùng manifest demo; code **không tự chia tập**. Cần hai manifest riêng để đánh giá trên tập validation độc lập.
 
 ## 4. Loss, momentum model và queue
 
@@ -248,7 +301,7 @@ Queue lưu feature ảnh `[capacity, Q, D]`, text `[capacity, D]`, `image_ids` `
 | Dữ liệu và cache | `DATASET_NAMESPACE`, `JSON_PATH_TRAIN`, `JSON_PATH_VAL`, `IMAGE_DIR`, `CACHE_DIR`, `CACHE_CHUNK_SIZE` |
 | Transform | `IMAGE_SIZE`, `NORMALIZATION`, `CROP_SCALE`, `CROP_RATIO`, `INTERPOLATION`, `ANTIALIAS`, các xác suất augmentation |
 | Tokenizer | `TOKENIZER_MODEL_ID`, `TOKENIZER_USE_FAST`, `MAX_LENGTH`, `TOKENIZER_PADDING`, `TOKENIZER_TRUNCATION` |
-| Loader | `BATCH_SIZE`, `NUM_WORKERS`, `DROP_LAST`, `SHUFFLE`, `PIN_MEMORY`, `PERSISTENT_WORKERS`, `PREFETCH_FACTOR` |
+| Loader | `BATCH_SIZE`, `NUM_WORKERS`, `DROP_LAST`, `SHUFFLE`, `PIN_MEMORY`, `PERSISTENT_WORKERS`, `PREFETCH_FACTOR`, `LENGTH_MEGA_BATCH_MULT`, `LENGTH_JITTER` |
 | Optimizer/scheduler | `LR`, `MIN_LR`, `WEIGHT_DECAY`, `ADAM_BETAS`, `ADAM_EPS`, `EPOCHS`, `WARMUP_EPOCHS` |
 | Training | `SEED`, `DEVICE`, `ACCUMULATION_STEPS`, `AMP_ENABLED`, `AMP_DTYPE`, `MAX_GRAD_NORM` |
 | Loss và momentum | `ITC_WEIGHT`, `ITM_WEIGHT`, `ITG_WEIGHT`, `PSEUDO_WEIGHT`, `PSEUDO_WARMUP_EPOCHS`, `TEMPERATURE`, `MOMENTUM`, `QUEUE_SIZE` |
@@ -273,7 +326,7 @@ Cách tính này giả định engine thực hiện optimizer step cho nhóm acc
 
 Pseudo weight tăng tuyến tính từ 0 đến `PSEUDO_WEIGHT` trong `PSEUDO_WARMUP_EPOCHS`, sau đó giữ nguyên. Đặt thời gian warmup bằng 0 để dùng mức đích ngay. Criterion được tạo một lần. Trong mỗi batch, tính `epoch_progress = epoch + batch_idx / len(train_loader)`, gọi `get_pseudo_weight(epoch_progress, state.settings)` và truyền kết quả qua đối số `pseudo_weight` của `get_itc_loss()`. Khi resume, dùng epoch và batch index thực tế đã khôi phục.
 
-`prepare_training()` áp dụng `DEVICE`, dựng scaler khi bật AMP float16 và khôi phục checkpoint khi resume. `train_one_epoch()` thực thi autocast, gradient clipping, accumulation và cập nhật pseudo weight theo batch. Scheduler, EMA, queue và global step chỉ cập nhật khi optimizer step thành công; momentum keys của các micro-batch được enqueue sau bước đó. Trong mỗi nhóm accumulation (kể cả nhóm cuối), ITC chuẩn hóa theo tổng số mẫu, ITM theo số cặp có negative, ITG theo số token hợp lệ. Engine gom các batch input của nhóm trước forward để biết mẫu số, không giữ đồ thị gradient qua các micro-batch. Candidates ITC/ITM vẫn theo từng micro-batch, không mở rộng thành một batch contrastive lớn. Gradient NaN/Inf hoặc norm clipping không hữu hạn sẽ bỏ qua optimizer/scheduler/EMA/queue/global step, rồi xóa gradient; quy tắc áp dụng cả FP32 và bfloat16 khi không có GradScaler. Lịch log/save/validate chưa được nối vào vòng lặp. Các factory model/loss/optimizer/scheduler nhận `settings` tùy chọn, mặc định dùng `config.py`.
+`prepare_training()` áp dụng `DEVICE`, dựng scaler khi bật AMP float16 và khôi phục checkpoint khi resume. `train_one_epoch()` thực thi autocast, gradient clipping, accumulation và cập nhật pseudo weight theo batch. Scheduler, EMA, queue và global step chỉ cập nhật khi optimizer step thành công; momentum keys của các micro-batch được enqueue sau bước đó. Trong mỗi nhóm accumulation (kể cả nhóm cuối), ITC chuẩn hóa theo tổng số mẫu, ITM theo số cặp có negative, ITG theo số token hợp lệ. Engine gom các batch input của nhóm trước forward để biết mẫu số, không giữ đồ thị gradient qua các micro-batch. Candidates ITC/ITM vẫn theo từng micro-batch, không mở rộng thành một batch contrastive lớn. Gradient NaN/Inf hoặc norm clipping không hữu hạn sẽ bỏ qua optimizer/scheduler/EMA/queue/global step, rồi xóa gradient; quy tắc áp dụng cả FP32 và bfloat16 khi không có GradScaler. Lịch log/save/validate được gọi qua `_training_events()`. Các factory model/loss/optimizer/scheduler nhận `settings` tùy chọn, mặc định dùng `config.py`.
 
 ## 6. Quản lý checkpoint
 
@@ -459,16 +512,21 @@ python -m src.trainingph1.model
 python -m src.queue.moco
 
 # Đọc dataset cấu hình và hiển thị ảnh/caption
-python -m src.data.dataloaderph1
+python -m src.data.dataloaderph1_multilevel
 
 # Demo vision encoder; đoạn demo hiện yêu cầu CUDA
 python -m src.vision
 
-# Kiểm thử checkpoint trên CPU, không tải pretrained weights
+# Kiểm thử dataloader multilevel trên CPU (cần pytest)
+python -m pytest tests/test_dataloaderph1_multilevel.py -q -ra
+
+# Các test unittest, gồm checkpoint, engine và loss
 python -m unittest discover -s tests -v
 ```
 
 Demo model/Q-Former cần tải hoặc có sẵn pretrained weights. Một số demo model dùng tham số trực tiếp trong `main()`, không đọc toàn bộ `config.py`; chúng phục vụ kiểm tra tensor, không phải entry point training. Demo dữ liệu yêu cầu manifest và ảnh tồn tại theo config.
+
+Bộ test dataloader multilevel đã qua **162 tests**, dùng ảnh/tokenizer giả lập trên CPU. Phạm vi gồm cache, token lengths lớn, grouping, seed/epoch, coverage và padding trên 2/3/4 rank giả lập, 2 workers và process group Gloo thật 2 rank. Đây là kiểm chứng module dataloader, chưa phải training FSDP trên GPU. Môi trường chặn multiprocessing có thể khiến các test workers/Gloo bị skip; xem phần tóm tắt của pytest.
 
 `tests/test_checkpoint.py` dùng BERT/DINOv3 nhỏ để kiểm tra:
 
@@ -482,7 +540,9 @@ Demo model/Q-Former cần tải hoặc có sẵn pretrained weights. Một số 
 
 | Phần | Công việc còn thiếu |
 | --- | --- |
-| Data resume | Khôi phục chính xác sampler/augmentation giữa epoch; hiện chỉ bỏ qua batch trước `next_batch` |
+| Tích hợp multilevel | Nối dataset/loader và epoch helper vào engine; dùng `valid_mask` trong loss, metrics và queue |
+| Distributed training | Runtime, model/EMA sharding, global loss/keys và đồng bộ step/skip theo kế hoạch FSDP |
+| Data resume | Tạm hoãn cùng quản lý checkpoint distributed; cần kiểm chứng sampler/augmentation khi triển khai |
 | Fine-tune | Entry point trong `trainingph1/finetune.py` |
 | Logging/artifacts | Logger, TensorBoard và ghi kết quả |
 | LLM integration | Nối projector với LLM và pipeline cho giai đoạn tiếp theo |
