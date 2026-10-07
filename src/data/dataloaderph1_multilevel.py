@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
-from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import AutoTokenizer
@@ -40,8 +40,11 @@ def build_transform(image_size, is_training, normalization,
     return transforms.Compose(aug)
 
 def _distributed_info(enabled=True):
-    active = enabled and dist.is_available() and dist.is_initialized()
-    return active, dist.get_rank() if active else 0, dist.get_world_size() if active else 1
+    if not enabled:
+        return False, 0, 1
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("distributed=True requires an initialized process group")
+    return True, dist.get_rank(), dist.get_world_size()
 
 def _safe_name(name):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name))
@@ -139,7 +142,7 @@ def load_token_lengths(cache_path):
         n = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
         return np.fromiter(
             (row[0] for row in conn.execute("SELECT token_length FROM samples ORDER BY id")),
-            dtype=np.uint16,
+            dtype=np.int64,
             count=n,
         )
 
@@ -181,6 +184,9 @@ class VLMDatasetStage1(Dataset):
         return self.conn
 
     def __getitem__(self, idx):
+        valid = None
+        if isinstance(idx, tuple):
+            idx, valid = idx
         row = self._db().execute(
             "SELECT image_name, text FROM samples WHERE id=?",
             (int(idx),),
@@ -202,7 +208,8 @@ class VLMDatasetStage1(Dataset):
         with Image.open(image_path) as img:
             image = self.transform(img.convert("RGB"))
 
-        return image, text, image_id
+        sample = (image, text, image_id)
+        return sample if valid is None else (*sample, valid)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -217,7 +224,7 @@ class VLMDataCollator:
         self.truncation = truncation
 
     def __call__(self, batch):
-        images, texts, image_ids = zip(*batch)
+        images, texts, image_ids = zip(*(sample[:3] for sample in batch))
         tokens = self.tokenizer(
             texts,
             padding=self.padding,
@@ -230,12 +237,14 @@ class VLMDataCollator:
             "image_ids": torch.tensor(image_ids, dtype=torch.long),
             "input_ids": tokens["input_ids"],
             "attention_mask": tokens["attention_mask"].bool(),
+            "valid_mask": torch.tensor([sample[3] if len(sample) == 4 else True
+                                        for sample in batch], dtype=torch.bool),
         }
 
 class MultiLevelLengthBatchSampler(BatchSampler):
     def __init__(self, lengths, batch_size, drop_last=True, shuffle=True,
                  mega_batch_mult=32, length_jitter=4, seed=0,
-                 distributed=False):
+                 distributed=False, length_aware=True):
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
         if mega_batch_mult <= 0:
@@ -244,6 +253,7 @@ class MultiLevelLengthBatchSampler(BatchSampler):
             raise ValueError("length_jitter must be >= 0")
 
         self.lengths = np.asarray(lengths)
+        self.length_aware = length_aware
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
         self.shuffle = bool(shuffle)
@@ -253,60 +263,46 @@ class MultiLevelLengthBatchSampler(BatchSampler):
         self.epoch = 0
 
         self.distributed, self.rank, self.world_size = _distributed_info(distributed)
-        if self.distributed and not self.drop_last:
-            raise ValueError(
-                "Distributed training should use drop_last=True so all ranks "
-                "execute the same number of optimizer steps."
-            )
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
-    def _num_global_batches(self):
-        n = len(self.lengths)
-        batches = n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
-        if self.distributed:
-            batches -= batches % self.world_size
-        return batches
-
     def __len__(self):
-        return self._num_global_batches() // self.world_size
+        global_batch_size = self.batch_size * self.world_size
+        n = len(self.lengths)
+        return n // global_batch_size if self.drop_last else math.ceil(n / global_batch_size)
 
     def __iter__(self):
+        batches = self._batches()
+        for step in range(len(self) * self.world_size):
+            batch = next(batches, [])
+            if self.distributed and not self.drop_last:
+                # Padding is marked by slot, never deduplicated by image ID.
+                padding = [(batch[0] if batch else 0, False)] * (self.batch_size - len(batch))
+                batch = [(idx, True) for idx in batch] + padding
+            if step % self.world_size == self.rank:
+                yield batch
+
+    def _batches(self):
         n = len(self.lengths)
         rng = np.random.default_rng(self.seed + self.epoch)
-
         indices = np.arange(n, dtype=np.int32 if n < 2**31 else np.int64)
         if self.shuffle:
             rng.shuffle(indices)
-
-        global_batch_limit = self._num_global_batches()
-        produced_global = 0
         window_size = self.batch_size * self.mega_batch_mult
 
         for start in range(0, n, window_size):
-            if produced_global >= global_batch_limit:
-                break
-
             window = indices[start:start + window_size]
-            if len(window) == 0:
-                continue
-
-            score = self.lengths[window].astype(np.int32, copy=True)
-            if self.shuffle and self.length_jitter:
-                score += rng.integers(
-                    -self.length_jitter,
-                    self.length_jitter + 1,
-                    size=len(window),
-                    dtype=np.int32,
-                )
-
-            order = np.argsort(score, kind="stable")
-            grouped = window[order]
+            if self.length_aware:
+                score = self.lengths[window].astype(np.int64, copy=True)
+                if self.shuffle and self.length_jitter:
+                    score += rng.integers(-self.length_jitter, self.length_jitter + 1,
+                                          size=len(window), dtype=np.int32)
+                window = window[np.argsort(score, kind="stable")]
 
             batches = []
-            for b_start in range(0, len(grouped), self.batch_size):
-                batch = grouped[b_start:b_start + self.batch_size]
+            for b_start in range(0, len(window), self.batch_size):
+                batch = window[b_start:b_start + self.batch_size]
                 if len(batch) < self.batch_size and self.drop_last:
                     continue
                 batch = batch.copy()
@@ -317,23 +313,18 @@ class MultiLevelLengthBatchSampler(BatchSampler):
             if self.shuffle:
                 rng.shuffle(batches)
 
-            for batch in batches:
-                if produced_global >= global_batch_limit:
-                    break
-
-                global_id = produced_global
-                produced_global += 1
-
-                if global_id % self.world_size == self.rank:
-                    yield batch.tolist()
+            yield from (batch.tolist() for batch in batches)
 
 def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
                      drop_last, shuffle, pin_memory, persistent_workers,
                      prefetch_factor, collate_fn, distributed=False,
                      length_aware=True, mega_batch_mult=32,
                      length_jitter=4, seed=0):
+    """batch_size is per rank; distributed drop_last=False pads slots with valid_mask=False."""
     shuffle = dataset.is_training if shuffle is None else shuffle
     distributed_active, rank, _ = _distributed_info(distributed)
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty")
 
     generator = torch.Generator()
     generator.manual_seed(seed + rank)
@@ -350,45 +341,22 @@ def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
     if num_workers > 0:
         common["prefetch_factor"] = prefetch_factor
 
-    if dataset.is_training and length_aware:
-        lengths = load_token_lengths(dataset.cache_path)
-        batch_sampler = MultiLevelLengthBatchSampler(
-            lengths=lengths,
-            batch_size=batch_size,
-            drop_last=drop_last,
-            shuffle=shuffle,
-            mega_batch_mult=mega_batch_mult,
-            length_jitter=length_jitter,
-            seed=seed,
-            distributed=distributed_active,
-        )
-        return DataLoader(batch_sampler=batch_sampler, **common)
-
-    sampler = None
-    if distributed_active:
-        sampler = DistributedSampler(
-            dataset,
-            shuffle=shuffle if dataset.is_training else False,
-            drop_last=drop_last if dataset.is_training else False,
-        )
-
-    return DataLoader(
-        batch_size=batch_size,
-        sampler=sampler,
-        shuffle=shuffle if sampler is None else False,
-        drop_last=drop_last if dataset.is_training else False,
-        **common,
+    length_aware = dataset.is_training and length_aware
+    lengths = load_token_lengths(dataset.cache_path) if length_aware else np.zeros(len(dataset), dtype=np.uint8)
+    sampler = MultiLevelLengthBatchSampler(
+        lengths, batch_size, drop_last=drop_last if dataset.is_training else False,
+        shuffle=shuffle if dataset.is_training else False, mega_batch_mult=mega_batch_mult,
+        length_jitter=length_jitter, seed=seed, distributed=distributed_active,
+        length_aware=length_aware,
     )
+    loader = DataLoader(batch_sampler=sampler, **common)
+    if len(loader) == 0:
+        raise ValueError("Dataloader is empty; reduce batch_size/world_size or add samples")
+    return loader
 
 def set_dataloader_epoch(loader, epoch):
-    sampler = getattr(loader, "batch_sampler", None)
-    if hasattr(sampler, "set_epoch"):
-        sampler.set_epoch(epoch)
-        return
+    loader.batch_sampler.set_epoch(epoch)
 
-    sampler = getattr(loader, "sampler", None)
-    if hasattr(sampler, "set_epoch"):
-        sampler.set_epoch(epoch)
 
 def check_batch_length_stats(loader):
     total_range = 0.0
