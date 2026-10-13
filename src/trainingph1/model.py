@@ -28,10 +28,10 @@ class ITCEncoder(nn.Module):
 class ModelStage1(nn.Module):
     def __init__(self, bert_name, return_layer, model_vision_id, num_queries,
                  cross_attn_every, hidden_dim, itc_dim, normalize_eps,
-                 bert_config=None, vision_config=None):
+                 bert_config=None, vision_config=None, vision_mock=True):
         super().__init__()
         self.bert_name = bert_name
-        self.vision_encoder = ImageEncoder(return_layer, model_vision_id, vision_config, mock=True)
+        self.vision_encoder = ImageEncoder(return_layer, model_vision_id, vision_config, mock=vision_mock)
         bert = (BertModel.from_pretrained(bert_name, add_pooling_layer=False) if bert_config is None
                 else BertModel(bert_config, add_pooling_layer=False))
         self.embeddings = bert.embeddings.requires_grad_(False).eval()
