@@ -1,259 +1,168 @@
-import copy
+"""One checkpoint contract across engines and process-group topologies."""
 import json
-import random
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
 import torch
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from transformers import BertConfig, DINOv3ViTConfig, PreTrainedTokenizerFast
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-from src import config
+from src.trainingph1 import engine, engine_checkpoint as checkpoint
 from src.queue.ema import EMA
-from src.queue.moco import MoCoQueue
-from src.trainingph1.model import ModelStage1
-from src.trainingph1.engine import prepare_training, get_pseudo_weight, run_training
-from src.utils.checkpoint import create_run, save_checkpoint, load_pretrained, load_checkpoint
+from test_checkpoint_fsdp import fixture, tiny_model, tokenizer, prepare, snapshot, assert_equal
+
+
+def prepare_single(settings):
+    def model(options):
+        online = tiny_model()
+        return online, EMA(online.itc_encoder, options['MOMENTUM'])
+    with patch.object(engine, 'get_model', side_effect=model), \
+         patch.object(engine.AutoTokenizer, 'from_pretrained', side_effect=lambda *a, **k: tokenizer()):
+        return engine.prepare_training(settings)
+
+
+def full_snapshot(state):
+    from torch.distributed.checkpoint.state_dict import get_state_dict, get_model_state_dict, StateDictOptions
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    model, optimizer = get_state_dict(state.model, state.optimizer, options=options)
+    ema = get_model_state_dict(state.ema.model, options=options)
+    return dict(model=model, optimizer=optimizer, ema=ema, queue=state.queue.state_dict(),
+                scheduler=state.scheduler.state_dict(), progress=state.progress, events=state.events)
+
+
+def cross_topology_worker(rank, folder):
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method='file://' + folder + '/store', rank=rank, world_size=2)
+    try:
+        settings = json.loads((Path(folder) / 'settings.json').read_text())
+        state = prepare(settings)
+        full = full_snapshot(state)
+        if rank == 0:
+            torch.save(full, Path(folder) / 'loaded.pt')
+        # Check that every remaining global batch has exactly the same real samples.
+        local_batches = list(state.train_loader.batch_sampler)
+        gathered = [None, None]
+        dist.all_gather_object(gathered, local_batches)
+        if rank == 0:
+            merged = [[index for local in gathered for index, valid in local[step] if valid]
+                      for step in range(len(local_batches))]
+            (Path(folder) / 'batches.json').write_text(json.dumps(merged))
+        checkpoint.save_checkpoint(state)
+        fresh = prepare(settings | dict(RESUME_CHECKPOINT=None, INIT_CHECKPOINT=str(state.run_dir),
+                                        TRAINING_MODE='finetune', RUN_NAME='distributed_finetune'))
+        assert not fresh.optimizer.state and fresh.progress['global_step'] == 0
+        assert fresh.queue.count.item() == 0
+        # A sharded update must survive a subsequent single-device load.
+        from src.trainingph1.engine_fsdp import train_one_epoch
+        train_one_epoch(state, state.progress['epoch'])
+        full = full_snapshot(state)
+        if rank == 0:
+            torch.save(full, Path(folder) / 'updated.pt')
+        checkpoint.save_checkpoint(state)
+    finally:
+        dist.destroy_process_group()
 
 
 class CheckpointTests(unittest.TestCase):
     def setUp(self):
+        torch.set_num_threads(1)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.model = ModelStage1(
-            'tiny-bert', -1, 'tiny-vision', 2, 1, 8, 4, 1e-12,
-            bert_config=BertConfig(vocab_size=5, hidden_size=8, num_hidden_layers=1,
-                                   num_attention_heads=2, intermediate_size=16),
-            vision_config=DINOv3ViTConfig(hidden_size=8, num_hidden_layers=1,
-                                         num_attention_heads=2, intermediate_size=16,
-                                         image_size=16, patch_size=8),
-        )
-        backend = Tokenizer(WordLevel({'[UNK]': 0, '[PAD]': 1, '[CLS]': 2, 'a': 3, 'b': 4}, unk_token='[UNK]'))
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token='[UNK]', pad_token='[PAD]')
-        self.run = create_run(self.model, self.tokenizer, run_dir=self.root / 'pretrain')
-        self.objects = self.components(self.model)
-        self.step(self.model, self.objects)
-        self.path = self.save(self.run, self.model, self.objects, 1)
+        self.settings = fixture(self.temp.name) | dict(RUN_NAME='single', TENSORBOARD_ENABLED=False)
 
-    def components(self, model):
-        optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=1e-3)
-        return dict(optimizer=optimizer, scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda n: 0.9**n),
-                    scaler=torch.amp.GradScaler('cpu'), ema=EMA(model.itc_encoder, 0.9), queue=MoCoQueue(4, 2, 4))
+    def test_single_and_reference_engine_share_resume_and_finetune_format(self):
+        single = prepare_single(self.settings)
+        engine.train_one_epoch(single, 0)
+        checkpoint.save_checkpoint(single, best=True)
+        expected = snapshot(single)
+        source = str(single.run_dir)
+        reference = prepare(self.settings | dict(RESUME_CHECKPOINT=source))
+        assert_equal(snapshot(reference), expected)
+        checkpoint.save_checkpoint(reference)
+        resumed = prepare_single(self.settings | dict(RESUME_CHECKPOINT=source))
+        assert_equal(snapshot(resumed), expected)
+        fresh = prepare_single(self.settings | dict(TRAINING_MODE='finetune', INIT_CHECKPOINT=source,
+                                                    RUN_NAME='finetune', LR=.002))
+        assert_equal(snapshot(fresh)['model'], expected['model'])
+        self.assertFalse(fresh.optimizer.state)
+        self.assertEqual(fresh.optimizer.param_groups[0]['lr'], .002)
+        self.assertEqual(fresh.progress, dict(epoch=0, next_batch=0, global_step=0))
+        self.assertEqual(fresh.queue.count.item(), 0)
+        self.assertEqual(fresh.events, {})
+        for name, parameter in fresh.ema.model.named_parameters():
+            torch.testing.assert_close(parameter, dict(fresh.model.itc_encoder.named_parameters())[name], rtol=0, atol=0)
 
-    def step(self, model, objects):
-        model.train()
-        images, ids = torch.randn(2, 3, 16, 16), torch.tensor([[2, 3], [2, 4]])
-        loss = model(model.encode_image(images), ids, torch.ones_like(ids), 'itm')['itm_logits'].square().mean()
-        if objects['scaler'] is None:
-            loss.backward()
-            objects['optimizer'].step()
-        else:
-            objects['scaler'].scale(loss).backward()
-            objects['scaler'].step(objects['optimizer'])
-            objects['scaler'].update()
-        objects['scheduler'].step()
-        objects['optimizer'].zero_grad(set_to_none=True)
-        objects['ema'].update(model.itc_encoder)
-        objects['queue'].enqueue(torch.randn(2, 2, 4), torch.randn(2, 4), torch.tensor([11, 22]))
+    def test_save_is_atomic_and_preserves_rng_and_empty_optimizer(self):
+        state = prepare_single(self.settings)
+        before = snapshot(state)
+        rng = checkpoint._rng(torch.device('cpu'))
+        checkpoint.save_checkpoint(state, best=True)
+        assert_equal(checkpoint._rng(torch.device('cpu')), rng)
+        assert_equal(snapshot(state), before)
+        pointers = {name: (state.run_dir / name).read_bytes() for name in ('last.json', 'best.json')}
+        with patch.object(checkpoint.dcp, 'save', side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(OSError, 'disk full'):
+                checkpoint.save_checkpoint(state, best=True)
+        for name, value in pointers.items():
+            self.assertEqual((state.run_dir / name).read_bytes(), value)
+        resumed = prepare_single(self.settings | dict(RESUME_CHECKPOINT=str(state.run_dir)))
+        assert_equal(snapshot(resumed), before)
 
-    def save(self, run, model, objects, step, **kwargs):
-        return save_checkpoint(run, model, **objects, global_step=step, epoch=0, next_batch=step,
-                               data_state={'sampler_order': [2, 0, 1]}, **kwargs)
+    def test_offline_pretrained_and_metadata_validation(self):
+        state = prepare_single(self.settings)
+        checkpoint.save_checkpoint(state)
+        with patch('transformers.BertModel.from_pretrained', side_effect=AssertionError('network')):
+            model, token, settings = checkpoint.load_pretrained(str(state.run_dir))
+        assert_equal(model.state_dict(), state.model.state_dict())
+        self.assertEqual(token('caption caption'), state.tokenizer('caption caption'))
+        path, metadata = checkpoint.read_checkpoint(str(state.run_dir))
+        metadata['architecture']['args']['num_queries'] += 1
+        with self.assertRaisesRegex(RuntimeError, 'architecture'):
+            checkpoint.load_checkpoint(path, metadata, state)
+        (path / 'checkpoint.json').unlink()
+        with self.assertRaises(RuntimeError):
+            checkpoint.read_checkpoint(str(state.run_dir))
 
-    def assert_state_equal(self, left, right):
-        if isinstance(left, torch.Tensor):
-            torch.testing.assert_close(left, right, rtol=0, atol=0)
-        elif isinstance(left, dict):
-            self.assertEqual(left.keys(), right.keys())
-            for key in left:
-                self.assert_state_equal(left[key], right[key])
-        elif isinstance(left, (list, tuple)):
-            self.assertEqual(len(left), len(right))
-            for a, b in zip(left, right):
-                self.assert_state_equal(a, b)
-        else:
-            self.assertEqual(left, right)
+    def test_checkpoint_directory_failure_is_broadcast(self):
+        with patch.object(checkpoint, '_rank', return_value=0), \
+             patch.object(checkpoint.dist, 'is_initialized', return_value=True), \
+             patch.object(checkpoint.dist, 'broadcast_object_list') as broadcast, \
+             patch.object(Path, 'mkdir', side_effect=PermissionError('denied')):
+            from types import SimpleNamespace
+            state = SimpleNamespace(settings=self.settings, model=tiny_model(), tokenizer=tokenizer())
+            # Config defaults are needed before create_run validation.
+            from src import config
+            state.settings = vars(config) | self.settings
+            with self.assertRaisesRegex(RuntimeError, 'denied'):
+                checkpoint.create_run(state)
+        broadcast.assert_called_once()
 
-    def assert_resume_matches_next_update(self, path, model, objects):
-        expected_random = random.random(), np.random.rand()
-        self.step(model, objects)
-        restored, _, _ = load_pretrained(path)
-        restored_objects = self.components(restored)
-        progress = load_checkpoint(path, restored, **restored_objects)
-        self.assertEqual(progress['data_state']['sampler_order'], [2, 0, 1])
-        self.assertEqual((random.random(), np.random.rand()), expected_random)
-        self.step(restored, restored_objects)
-        self.assert_state_equal(model.state_dict(), restored.state_dict())
-        for name in objects:
-            self.assert_state_equal(objects[name].state_dict(), restored_objects[name].state_dict())
-        self.assertEqual(objects['ema'].momentum, restored_objects['ema'].momentum)
-        return progress
-
-    def test_resume_pretrain_restores_complete_state_and_rng(self):
-        progress = self.assert_resume_matches_next_update(self.path, self.model, self.objects)
-        self.assertEqual((progress['global_step'], progress['epoch'], progress['next_batch']), (1, 0, 1))
-
-    def test_finetune_and_resume_finetune(self):
-        with patch.object(config, 'CROP_SCALE', (0.5, 1.0)), patch.object(config, 'NUM_QUERIES', 99), \
-             patch('transformers.BertModel.from_pretrained', side_effect=AssertionError('network')), \
-             patch('transformers.DINOv3ViTModel.from_pretrained', side_effect=AssertionError('network')):
-            model, tokenizer, _ = load_pretrained(self.path)
-            self.assertEqual(model.qformer_model.num_queries, 2)
-            self.assertEqual(tokenizer('a')['input_ids'], self.tokenizer('a')['input_ids'])
-            self.assert_state_equal(model.state_dict(), self.model.state_dict())
-            model.itm_logit.bias.requires_grad_(False)
-            objects = self.components(model)
-            self.assertFalse(objects['optimizer'].state)
-            run = create_run(model, tokenizer, run_dir=self.root / 'finetune', parent_checkpoint=self.path)
-            self.step(model, objects)
-            path = self.save(run, model, objects, 1)
-            metadata = json.loads((run / 'run.json').read_text())
-            self.assertEqual(metadata['config']['CROP_SCALE'], [0.5, 1.0])
-            self.assertEqual(metadata['parent_checkpoint'], str(self.path))
-            self.assertTrue(self.path.exists())
-            self.assert_resume_matches_next_update(path, model, objects)
-
-    def test_atomic_last_and_optional_best(self):
-        before = self.path.read_bytes()
-        with patch('src.utils.checkpoint.torch.save', side_effect=OSError('disk full')):
-            with self.assertRaises(OSError):
-                self.save(self.run, self.model, self.objects, 2)
-        self.assertEqual(self.path.read_bytes(), before)
-        self.assertFalse(list(self.run.glob('*.tmp')))
-        self.save(self.run, self.model, self.objects, 2)
-        best = self.save(self.run, self.model, self.objects, 2, filename='best.pt')
-        self.assertTrue(best.exists())
-        self.assertEqual(len(list(self.run.glob('*.pt'))), 2)
-        with self.assertRaises(FileExistsError):
-            create_run(self.model, self.tokenizer, run_dir=self.run)
-
-    def test_prepare_finetune_and_resume_uses_saved_settings(self):
-        settings = dict(INIT_CHECKPOINT=str(self.path), RESUME_CHECKPOINT=None,
-                        CHECKPOINT_DIR=str(self.root), MODEL_VERSION='v1', RUN_NAME='finetune',
-                        DEVICE='cpu', LR=0.002, MIN_LR=0.0001, EPOCHS=4, WARMUP_EPOCHS=1,
-                        ACCUMULATION_STEPS=2, MOMENTUM=0.95, QUEUE_SIZE=4, AMP_ENABLED=False,
-                        PSEUDO_WEIGHT=0.6, PSEUDO_WARMUP_EPOCHS=2, NUM_QUERIES=99, ITC_DIM=99)
-        with patch.multiple(config, **settings), \
-             patch('src.trainingph1.engine.get_dataloader', return_value=([0] * 4, [])), \
-             patch('src.trainingph1.engine.get_data_fingerprints', return_value={'train': 'original'}), \
-             patch('transformers.BertModel.from_pretrained', side_effect=AssertionError('network')), \
-             patch('transformers.DINOv3ViTModel.from_pretrained', side_effect=AssertionError('network')):
-            state = prepare_training()
-            self.assertEqual(state.run_dir, self.root / 'v1' / 'finetune')
-            self.assertEqual(state.queue.image.shape, (4, 2, 4))
-            self.assertFalse(state.optimizer.state)
-            self.assertEqual(state.progress['global_step'], 0)
-            self.assert_state_equal(state.model.state_dict(), self.model.state_dict())
-            objects = {name: getattr(state, name) for name in ('optimizer', 'scheduler', 'ema', 'queue', 'scaler')}
-            self.step(state.model, objects)
-            path = self.save(state.run_dir, state.model, objects, 1)
-            with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path),
-                                LR=0.5, EPOCHS=100, WARMUP_EPOCHS=10, ACCUMULATION_STEPS=1,
-                                MOMENTUM=0.1, QUEUE_SIZE=99, RUN_NAME='ignored', MODEL_VERSION='ignored'):
-                restored = prepare_training()
-            for fingerprints in ({'train': 'changed'}, {}):
-                with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path)), \
-                     patch('src.trainingph1.engine.get_data_fingerprints', return_value=fingerprints):
-                    with self.assertRaisesRegex(ValueError, 'fingerprint'):
-                        prepare_training()
-            model, tokenizer, saved = load_pretrained(path)
-            saved.pop('DATA_FINGERPRINTS')
-            with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path)), \
-                 patch('src.trainingph1.engine.load_pretrained', return_value=(model, tokenizer, saved)):
-                with self.assertRaisesRegex(ValueError, 'fingerprint is missing'):
-                    prepare_training()
-            self.assertEqual(restored.run_dir, state.run_dir)
-            self.assertEqual(restored.settings['LR'], 0.002)
-            self.assertEqual(restored.progress['next_batch'], 1)
-            epoch_progress = restored.progress['epoch'] + restored.progress['next_batch'] / len(restored.train_loader)
-            self.assertAlmostEqual(get_pseudo_weight(epoch_progress, restored.settings), 0.075)
-            restored_objects = {name: getattr(restored, name) for name in objects}
-            rng = torch.get_rng_state()
-            self.step(state.model, objects)
-            torch.set_rng_state(rng)
-            self.step(restored.model, restored_objects)
-            self.assert_state_equal(state.model.state_dict(), restored.model.state_dict())
-            for name in ('optimizer', 'scheduler', 'ema', 'queue'):
-                self.assert_state_equal(objects[name].state_dict(), restored_objects[name].state_dict())
-
-    def test_prepare_new_run_and_rejects_ambiguous_source(self):
-        with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=None,
-                            CHECKPOINT_DIR=str(self.root), MODEL_VERSION='v2', RUN_NAME='pretrain',
-                            DEVICE='cpu', AMP_ENABLED=False, QUEUE_SIZE=4), \
-             patch('src.trainingph1.engine.get_model', return_value=(self.model, EMA(self.model.itc_encoder, 0.99))), \
-             patch('src.trainingph1.engine.AutoTokenizer.from_pretrained', return_value=self.tokenizer), \
-             patch('src.trainingph1.engine.get_dataloader', return_value=([0] * 4, [])), \
-             patch('src.trainingph1.engine.get_data_fingerprints', return_value={'train': 'original'}):
-            state = prepare_training()
-            self.assertEqual(state.run_dir, self.root / 'v2' / 'pretrain')
-            self.assertIsNone(json.loads((state.run_dir / 'run.json').read_text())['parent_checkpoint'])
-            self.assertEqual(state.progress['epoch'], 0)
-            self.assertTrue(state.model.training)
-            self.assertFalse(state.ema.training)
-        with patch.multiple(config, INIT_CHECKPOINT='source.pt', RESUME_CHECKPOINT='last.pt'):
-            with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
-                prepare_training()
-
-    def test_engine_periodic_checkpoint_resumes_mid_epoch_exactly(self):
-        ids = torch.tensor([[2, 3, 4], [2, 4, 3]])
-        batches = [dict(images=torch.randn(2, 3, 16, 16), input_ids=ids,
-                        attention_mask=torch.ones_like(ids, dtype=torch.bool), image_ids=torch.tensor([11, 22]))
-                   for _ in range(3)]
-        settings = dict(INIT_CHECKPOINT=str(self.path), RESUME_CHECKPOINT=None,
-                        CHECKPOINT_DIR=str(self.root), MODEL_VERSION='v1', RUN_NAME='baseline',
-                        DEVICE='cpu', AMP_ENABLED=False, EPOCHS=2, WARMUP_EPOCHS=0,
-                        ACCUMULATION_STEPS=2, QUEUE_SIZE=8, SAVE_EVERY_STEPS=1,
-                        VAL_EVERY_STEPS=1, LOG_EVERY_STEPS=0)
-        with patch.multiple(config, **settings), \
-             patch('src.trainingph1.engine.get_dataloader', return_value=(batches, batches)), \
-             patch('src.trainingph1.engine.get_data_fingerprints', return_value={'train': 'original'}), \
-             patch('builtins.print'):
-            baseline = run_training()
-            def interrupt_after_save(*args, **kwargs):
-                path = save_checkpoint(*args, **kwargs)
-                if kwargs['filename'] == 'last.pt':
-                    raise RuntimeError('interrupted')
-                return path
-            with patch.object(config, 'RUN_NAME', 'interrupted'), \
-                 patch('src.trainingph1.engine.save_checkpoint', side_effect=interrupt_after_save):
-                with self.assertRaisesRegex(RuntimeError, 'interrupted'):
-                    run_training()
-            path = self.root / 'v1' / 'interrupted' / 'last.pt'
-            payload = torch.load(path, weights_only=True)
-            self.assertEqual((payload['epoch'], payload['next_batch'], payload['global_step']), (0, 2, 1))
-            self.assertIn('best_val_loss', payload['data_state'])
-            with patch.multiple(config, INIT_CHECKPOINT=None, RESUME_CHECKPOINT=str(path)):
-                restored = run_training()
-            self.assert_state_equal(baseline.model.state_dict(), restored.model.state_dict())
-            for name in ('optimizer', 'scheduler', 'ema', 'queue'):
-                self.assert_state_equal(getattr(baseline, name).state_dict(), getattr(restored, name).state_dict())
-            self.assertEqual(baseline.progress, restored.progress)
-            final = torch.load(path, weights_only=True)
-            self.assertEqual((final['epoch'], final['next_batch'], final['global_step']), (2, 0, 4))
-
-    def test_rejects_wrong_run_architecture_and_missing_components(self):
-        other = create_run(self.model, self.tokenizer, run_dir=self.root / 'other')
-        copied = other / 'last.pt'
-        copied.write_bytes(self.path.read_bytes())
-        with self.assertRaisesRegex(ValueError, 'run.json'):
-            load_pretrained(copied)
-        self.model.vision_encoder.return_layer = -2
-        with self.assertRaisesRegex(ValueError, 'architecture'):
-            load_checkpoint(self.path, self.model, **self.objects)
-        self.model.vision_encoder.return_layer = -1
-        with self.assertRaisesRegex(ValueError, 'components'):
-            load_checkpoint(self.path, self.model, optimizer=self.objects['optimizer'], scheduler=self.objects['scheduler'])
-        before = copy.deepcopy(self.model.state_dict())
-        self.objects['optimizer'].param_groups[0]['params'].reverse()
-        with self.assertRaisesRegex(ValueError, 'groups'):
-            load_checkpoint(self.path, self.model, **self.objects)
-        self.assert_state_equal(before, self.model.state_dict())
-
-
-if __name__ == '__main__':
-    unittest.main()
+    @unittest.skipUnless(os.environ.get('RUN_DISTRIBUTED_TESTS') == '1', 'requires local process sockets')
+    def test_single_to_two_shards_and_back_mid_epoch(self):
+        # Odd global size also exercises padding when the topology changes.
+        state = prepare_single(self.settings | dict(BATCH_SIZE=3, ACCUMULATION_STEPS=1))
+        class Stop(Exception):
+            pass
+        def stop(current, metrics):
+            checkpoint.save_checkpoint(current)
+            raise Stop()
+        with self.assertRaises(Stop):
+            engine.train_one_epoch(state, 0, on_step=stop)
+        expected = full_snapshot(state)
+        batches = [[index for index, valid in batch if valid] for batch in state.train_loader.batch_sampler]
+        settings = self.settings | dict(RESUME_CHECKPOINT=str(state.run_dir))
+        (Path(self.temp.name) / 'settings.json').write_text(json.dumps(settings))
+        mp.spawn(cross_topology_worker, args=(self.temp.name,), nprocs=2, join=True)
+        assert_equal(torch.load(Path(self.temp.name) / 'loaded.pt', weights_only=True), expected)
+        self.assertEqual(json.loads((Path(self.temp.name) / 'batches.json').read_text()), batches)
+        restored = prepare_single(settings)
+        assert_equal(full_snapshot(restored), torch.load(Path(self.temp.name) / 'updated.pt', weights_only=True))
+        fresh = prepare_single(self.settings | dict(TRAINING_MODE='finetune', INIT_CHECKPOINT=str(state.run_dir),
+                                                    RUN_NAME='single_finetune'))
+        assert_equal(fresh.model.state_dict(), restored.model.state_dict())
+        self.assertFalse(fresh.optimizer.state)
+        engine.train_one_epoch(restored, restored.progress['epoch'])
+        self.assertGreater(restored.progress['global_step'], state.progress['global_step'])

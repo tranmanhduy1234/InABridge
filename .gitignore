@@ -47,4 +47,10 @@ venv/
 !/tests/test_losses.py
 !/tests/test_engine.py
 !/tests/test_image_ids.py
+!/tests/test_dataloaderph1_multilevel.py
+!/tests/test_engine_fsdp.py
+!/tests/test_checkpoint_fsdp.py
+!/tests/test_logging.py
+!/tests/test_training_diagnostics.py
+!/tests/test_languagemodel.py
 /documents

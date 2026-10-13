@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 import torch
 
@@ -9,6 +11,34 @@ class LossTests(unittest.TestCase):
     def setUp(self):
         self.criterion = Stage1Criterion()
 
+    def test_optional_masks_match_all_true_and_warn(self):
+        images, texts = torch.randn(2, 2, 4), torch.randn(2, 4)
+        ids, valid = torch.arange(2), torch.ones(2, dtype=torch.bool)
+        cases = [
+            (self.criterion.get_itm_loss, (torch.randn(2), torch.zeros(2)), {}),
+            (self.criterion.get_itg_loss, (torch.randn(2, 3, 4), torch.zeros(2, 3, dtype=torch.long)), {}),
+            (self.criterion.get_itc_loss,
+             (images, texts, images, texts, images[:0], texts[:0], .07, .4, ids, ids[:0]),
+             dict(global_image_keys=images, global_text_keys=texts, global_image_ids=ids)),
+        ]
+        for fn, args, kwargs in cases:
+            masks = dict(valid_mask=valid)
+            if kwargs:
+                masks['global_valid_mask'] = valid
+            output = StringIO()
+            with redirect_stdout(output):
+                expected = fn(*args, **kwargs, **masks)
+            self.assertEqual(output.getvalue(), '')
+            for omitted in (True, False):
+                with self.subTest(loss=fn.__name__, omitted=omitted):
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        actual = fn(*args, **kwargs, **({} if omitted else dict.fromkeys(masks)))
+                    self.assertIn('FSDP', output.getvalue())
+                    self.assertIn('valid_mask=None', output.getvalue())
+                    for name in expected:
+                        torch.testing.assert_close(actual[name], expected[name])
+
     def test_itc_distributes_targets_across_same_ids_in_batch_and_queue(self):
         torch.manual_seed(5)
         features = [torch.nn.functional.normalize(torch.randn(*shape), dim=-1) for shape in
@@ -16,31 +46,35 @@ class LossTests(unittest.TestCase):
         image_ids, queue_ids = torch.tensor([10, 10, 20]), torch.tensor([10, 30])
         hard = torch.tensor([[1/3, 1/3, 0., 1/3, 0.], [1/3, 1/3, 0., 1/3, 0.], [0., 0., 1., 0., 0.]])
         for alpha in (0., .4):
-            out = self.criterion.get_itc_loss(*features, .07, alpha, image_ids, queue_ids)
+            out = self.criterion.get_itc_loss(
+                *features, .07, alpha, image_ids, queue_ids,
+                global_image_keys=features[2], global_text_keys=features[3], global_image_ids=image_ids)
             sim = lambda images, texts: torch.einsum('bqd,kd->bkq', images, texts).amax(-1) / .07
             teacher_i2t = sim(features[2], torch.cat((features[3], features[5]))).softmax(-1)
             teacher_t2i = sim(torch.cat((features[2], features[4])), features[3]).T.softmax(-1)
             targets = [(1-alpha)*hard + alpha*t for t in (teacher_i2t, teacher_t2i)]
             expected = sum(-(t * out[k].log_softmax(-1)).sum(-1).mean()
                            for t, k in zip(targets, ('logits_i2t', 'logits_t2i'))) / 2
-            torch.testing.assert_close(out['loss_itc'], expected)
+            torch.testing.assert_close(out['loss_itc_sum'] / out['count_itc'].clamp_min(1), expected)
 
     def test_itc_disables_autocast_for_similarity_and_loss(self):
         torch.manual_seed(3)
         features = [torch.nn.functional.normalize(torch.randn(*shape), dim=-1) for shape in
                     [(2, 2, 4), (2, 4), (2, 2, 4), (2, 4), (0, 2, 4), (0, 4)]]
         args = (*features, .07, .4, torch.arange(2), torch.empty(0, dtype=torch.long))
-        expected = self.criterion.get_itc_loss(*args)
+        kwargs = dict(global_image_keys=features[2], global_text_keys=features[3], global_image_ids=args[-2])
+        expected = self.criterion.get_itc_loss(*args, **kwargs)
         with torch.autocast('cpu', dtype=torch.bfloat16):
-            actual = self.criterion.get_itc_loss(*args)
+            actual = self.criterion.get_itc_loss(*args, **kwargs)
         for name, value in actual.items():
-            self.assertEqual(value.dtype, torch.float32)
+            self.assertEqual(value.dtype, torch.long if name == "count_itc" else torch.float32)
             torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
     def test_itm_uses_supplied_pair_labels(self):
         logits = torch.tensor([-3., 1., 2.], requires_grad=True)
         labels = torch.tensor([0, 1, 0])
-        loss = self.criterion.get_itm_loss(logits, labels)['loss_itm']
+        out = self.criterion.get_itm_loss(logits, labels)
+        loss = out['loss_itm_sum'] / out['count_itm'].clamp_min(1)
         expected = -(labels * logits.sigmoid().log() + (1 - labels) * (-logits).sigmoid().log()).mean()
         torch.testing.assert_close(loss, expected)
         loss.backward()
@@ -54,7 +88,8 @@ class LossTests(unittest.TestCase):
         input_ids = torch.tensor([[0, 1, 2, 0], [0, 2, 0, 0]])
         mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]])
         labels = input_ids.masked_fill(~mask.bool(), -100)[:, 1:]
-        loss = self.criterion.get_itg_loss(logits, labels)['loss_itg']
+        out = self.criterion.get_itg_loss(logits, labels)
+        loss = out['loss_itg_sum'] / out['count_itg'].clamp_min(1)
         scores = logits.log_softmax(-1)
         expected = -(scores[0, 0, 1] + scores[0, 1, 2] + scores[0, 2, 0] + scores[1, 0, 2]) / 4
         torch.testing.assert_close(loss, expected)
@@ -68,7 +103,8 @@ class LossTests(unittest.TestCase):
             with self.subTest(length=length):
                 logits = torch.zeros(2, length, 4, requires_grad=True)
                 labels = torch.full((2, length), -100, dtype=torch.long)
-                loss = self.criterion.get_itg_loss(logits, labels)['loss_itg']
+                out = self.criterion.get_itg_loss(logits, labels)
+                loss = out['loss_itg_sum'] / out['count_itg'].clamp_min(1)
                 self.assertEqual(loss.item(), 0)
                 loss.backward()
                 self.assertEqual(logits.grad.count_nonzero().item(), 0)
