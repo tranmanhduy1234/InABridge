@@ -1,11 +1,3 @@
-"""Khám phá tokenizer phase 1; không thay đổi tokenizer/model của training.
-
-python -m src.data.tokenizer --local-files-only --max-length 16
-Mặc định kiểm tra CLS/SEP như dataloader hiện tại.
-Thêm --demo-dec --inspect-embeddings để thử DEC và resize BERT trong RAM.
-DEC: https://github.com/salesforce/LAVIS/blob/main/lavis/models/blip2_models/blip2_qformer.py
-"""
-
 import argparse
 from copy import deepcopy
 import json
@@ -18,7 +10,6 @@ from src.qformer import generate_mask_qformer
 
 
 def tokenize_vlm_batch(tokenizer, texts, max_length):
-    """Dùng cùng thiết lập tokenization với VLMDataCollator, kiểm tra biên trước PAD."""
     if tokenizer.cls_token_id is None or tokenizer.sep_token_id is None:
         raise ValueError('Tokenizer phải có CLS và SEP')
     if tokenizer.padding_side != 'right':
@@ -189,7 +180,6 @@ def show_embeddings(tokenizer, extended, local_files_only, inspect_embeddings):
     print('Parameter vẫn là object cũ:', old_weight is new_weight, '| requires_grad:', new_weight.requires_grad)
     print('Norm hàng DEC mới:', new_weight[extended.bos_token_id].norm().item())
     print('Nếu LM head/optimizer giữ Parameter cũ, phải cập nhật sau thao tác thay embedding.')
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

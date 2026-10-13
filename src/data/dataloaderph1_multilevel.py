@@ -8,7 +8,6 @@ from pathlib import Path
 import ijson
 import numpy as np
 import torch
-import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import BatchSampler, DataLoader, Dataset
 from torchvision import transforms
@@ -35,18 +34,16 @@ def build_transform(image_size, is_training, normalization, crop_scale, crop_rat
         aug.append(transforms.Normalize(*normalization))
     return transforms.Compose(aug)
 
-def _distributed_info(enabled=True):
-    if not enabled:
-        return False, 0, 1
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("distributed=True requires an initialized process group")
-    return True, dist.get_rank(), dist.get_world_size()
-
 def _cache_signature(json_path, tokenizer, max_length):
     p = Path(json_path).resolve()
     stat = p.stat()
-    vocab = (tokenizer.backend_tokenizer.to_str() if tokenizer.is_fast
-             else json.dumps(tokenizer.get_vocab(), sort_keys=True))
+    if tokenizer.is_fast:
+        backend = json.loads(tokenizer.backend_tokenizer.to_str())
+        # Padding/truncation are per-call state; max_length is tracked separately.
+        backend['padding'] = backend['truncation'] = None
+        vocab = json.dumps(backend, sort_keys=True)
+    else:
+        vocab = json.dumps(tokenizer.get_vocab(), sort_keys=True)
     fingerprint = hashlib.sha256((vocab + json.dumps(
         tokenizer.special_tokens_map, sort_keys=True, default=str
     ) + tokenizer.truncation_side).encode()).hexdigest()
@@ -65,18 +62,17 @@ def _cache_is_valid(path, signature):
     except sqlite3.Error:
         return False
 
-def build_cache(json_path, cache_path, chunk_size, tokenizer, max_length, distributed=False):
-    active, rank, _ = _distributed_info(distributed)
+def build_cache(json_path, cache_path, chunk_size, tokenizer, max_length):
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive")
     path = Path(cache_path).resolve()
     signature = _cache_signature(json_path, tokenizer, max_length)
     error = None
 
-    if rank == 0 and not _cache_is_valid(path, signature):
-        path.parent.mkdir(parents=True, exist_ok=True)
+    if not _cache_is_valid(path, signature):
         tmp = path.with_name(path.name + ".tmp")
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp.unlink(missing_ok=True)
             with sqlite3.connect(tmp) as db:
                 db.execute("PRAGMA journal_mode=OFF")
@@ -105,13 +101,12 @@ def build_cache(json_path, cache_path, chunk_size, tokenizer, max_length, distri
                         flush(rows)
             tmp.replace(path)
         except Exception as exc:
-            tmp.unlink(missing_ok=True)
             error = f"Cache construction failed: {type(exc).__name__}: {exc}"
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass  # Preserve the original failure if cleanup also fails.
 
-    if active:
-        result = [error]
-        dist.broadcast_object_list(result, src=0)
-        error = result[0]
     if error:
         raise RuntimeError(error)
 
@@ -124,7 +119,7 @@ def load_token_lengths(cache_path):
 
 class VLMDatasetStage1(Dataset):
     def __init__(self, json_path, image_dir, is_training, cache_dir, chunk_size,
-                 transform, dataset_namespace, tokenizer, max_length, distributed=False):
+                 transform, dataset_namespace, tokenizer, max_length, prepare_cache=True):
         self.image_dir = Path(image_dir).resolve()
         self.dataset_namespace = dataset_namespace
         self.is_training = is_training
@@ -133,8 +128,9 @@ class VLMDatasetStage1(Dataset):
         split = "train" if is_training else "validation"
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(dataset_namespace))
         self.cache_path = Path(cache_dir).resolve() / f"{name}_{split}.sqlite"
-        build_cache(json_path, self.cache_path, chunk_size, tokenizer, max_length, distributed)
-        with sqlite3.connect(self.cache_path) as db:
+        if prepare_cache:
+            build_cache(json_path, self.cache_path, chunk_size, tokenizer, max_length)
+        with sqlite3.connect(f"file:{self.cache_path}?mode=ro", uri=True) as db:
             self.length = db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
 
     def __len__(self):
@@ -178,21 +174,23 @@ class VLMDataCollator:
 class MultiLevelLengthBatchSampler(BatchSampler):
     def __init__(self, lengths, batch_size, drop_last=True, shuffle=True,
                  mega_batch_mult=32, length_jitter=4, seed=0,
-                 distributed=False, length_aware=True):
+                 rank=0, num_replicas=1, pad_batches=False, length_aware=True):
         if batch_size <= 0 or mega_batch_mult <= 0 or length_jitter < 0:
             raise ValueError("Invalid sampler parameters")
         self.lengths = np.asarray(lengths)
         self.batch_size, self.drop_last, self.shuffle = int(batch_size), bool(drop_last), bool(shuffle)
         self.mega_batch_mult, self.length_jitter = int(mega_batch_mult), int(length_jitter)
         self.seed, self.epoch, self.length_aware = int(seed), 0, length_aware
-        self.distributed, self.rank, self.world_size = _distributed_info(distributed)
+        if num_replicas < 1 or not 0 <= rank < num_replicas:
+            raise ValueError("Invalid rank or num_replicas")
+        self.rank, self.num_replicas, self.pad_batches = rank, num_replicas, pad_batches
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
     def __len__(self):
         n = len(self.lengths)
-        size = self.batch_size * self.world_size
+        size = self.batch_size * self.num_replicas
         return n // size if self.drop_last else math.ceil(n / size)
 
     def __iter__(self):
@@ -200,7 +198,7 @@ class MultiLevelLengthBatchSampler(BatchSampler):
         indices = np.arange(len(self.lengths))
         if self.shuffle:
             rng.shuffle(indices)
-        step, total = 0, len(self) * self.world_size
+        step, total = 0, len(self) * self.num_replicas
         window_size = self.batch_size * self.mega_batch_mult
         for start in range(0, len(indices), window_size):
             window = indices[start:start + window_size]
@@ -221,8 +219,8 @@ class MultiLevelLengthBatchSampler(BatchSampler):
             for batch in batches:
                 if step >= total:
                     return
-                if step % self.world_size == self.rank:
-                    if self.distributed and not self.drop_last:
+                if step % self.num_replicas == self.rank:
+                    if self.pad_batches and not self.drop_last:
                         batch = [(idx, True) for idx in batch] + [
                             (batch[0], False)] * (self.batch_size - len(batch))
                     else:
@@ -230,24 +228,23 @@ class MultiLevelLengthBatchSampler(BatchSampler):
                     yield batch
                 step += 1
         while step < total:
-            if step % self.world_size == self.rank:
+            if step % self.num_replicas == self.rank:
                 yield [(0, False)] * self.batch_size
             step += 1
 
 def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
                      drop_last, shuffle, pin_memory, persistent_workers,
-                     prefetch_factor, collate_fn, distributed=False,
+                     prefetch_factor, collate_fn, rank=0, num_replicas=1, pad_batches=False,
                      length_aware=True, mega_batch_mult=32, length_jitter=4, seed=0):
     if not len(dataset):
         raise ValueError("Dataset is empty")
-    active, rank, _ = _distributed_info(distributed)
     sampler = MultiLevelLengthBatchSampler(
         load_token_lengths(dataset.cache_path) if dataset.is_training and length_aware
         else np.zeros(len(dataset), dtype=np.uint8), batch_size,
         drop_last=drop_last if dataset.is_training else False,
         shuffle=(dataset.is_training if shuffle is None else shuffle) if dataset.is_training else False,
         mega_batch_mult=mega_batch_mult, length_jitter=length_jitter, seed=seed,
-        distributed=active, length_aware=dataset.is_training and length_aware)
+        rank=rank, num_replicas=num_replicas, pad_batches=pad_batches, length_aware=dataset.is_training and length_aware)
     generator = torch.Generator().manual_seed(seed + rank)
     kwargs = dict(num_workers=num_workers, pin_memory=torch.cuda.is_available() if pin_memory is None
                   else pin_memory, persistent_workers=bool(persistent_workers and num_workers > 0),
@@ -256,7 +253,7 @@ def build_dataloader(dataset: VLMDatasetStage1, batch_size, num_workers,
         kwargs["prefetch_factor"] = prefetch_factor
     loader = DataLoader(dataset, batch_sampler=sampler, **kwargs)
     if not len(loader):
-        raise ValueError("No batches; reduce batch_size/world_size or add samples")
+        raise ValueError("No batches; reduce batch_size/num_replicas or add samples")
     return loader
 
 def set_dataloader_epoch(loader, epoch):
@@ -286,42 +283,41 @@ def main():
     import matplotlib.pyplot as plt
     seed_everything()
     root = Path(__file__).resolve().parents[2]
-    distributed = dist.is_available() and dist.is_initialized()
     tokenizer = AutoTokenizer.from_pretrained(cfg.TOKENIZER_MODEL_ID, use_fast=cfg.TOKENIZER_USE_FAST)
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is None:
             raise ValueError("Tokenizer has no PAD/EOS token")
         tokenizer.pad_token = tokenizer.eos_token
     transform = build_transform(
-        cfg.IMAGE_SIZE, cfg.IS_TRAINING, cfg.NORMALIZATION, cfg.CROP_SCALE,
+        cfg.IMAGE_SIZE, True, cfg.NORMALIZATION, cfg.CROP_SCALE,
         cfg.CROP_RATIO, cfg.INTERPOLATION, cfg.ANTIALIAS,
         cfg.HORIZONTAL_FLIP_PROBABILITY, cfg.COLOR_JITTER,
         cfg.COLOR_JITTER_PROBABILITY, cfg.GRAYSCALE_PROBABILITY,
         cfg.BLUR_KERNEL_SIZE, cfg.BLUR_SIGMA, cfg.BLUR_PROBABILITY)
     dataset = VLMDatasetStage1(
-        root / (cfg.JSON_PATH_TRAIN if cfg.IS_TRAINING else cfg.JSON_PATH_VAL),
-        root / cfg.IMAGE_DIR, cfg.IS_TRAINING, root / cfg.CACHE_DIR,
+        root / cfg.JSON_PATH_TRAIN,
+        root / cfg.IMAGE_DIR, True, root / cfg.CACHE_DIR,
         cfg.CACHE_CHUNK_SIZE, transform, cfg.DATASET_NAMESPACE, tokenizer,
-        cfg.MAX_LENGTH, distributed)
+        cfg.MAX_LENGTH)
     loader = build_dataloader(
         dataset, cfg.BATCH_SIZE, cfg.NUM_WORKERS, cfg.DROP_LAST, cfg.SHUFFLE,
         cfg.PIN_MEMORY, cfg.PERSISTENT_WORKERS, cfg.PREFETCH_FACTOR,
         VLMDataCollator(tokenizer, cfg.MAX_LENGTH, cfg.TOKENIZER_PADDING,
-                        cfg.TOKENIZER_TRUNCATION), distributed, cfg.IS_TRAINING,
-        getattr(cfg, "LENGTH_MEGA_BATCH_MULT", 32), getattr(cfg, "LENGTH_JITTER", 4),
-        getattr(cfg, "SEED", 0))
+                        cfg.TOKENIZER_TRUNCATION), length_aware=cfg.LENGTH_AWARE,
+        mega_batch_mult=getattr(cfg, "LENGTH_MEGA_BATCH_MULT", 32),
+        length_jitter=getattr(cfg, "LENGTH_JITTER", 4), seed=getattr(cfg, "SEED", 0))
     check_batch_length_stats(loader)
     for batch in loader:
         print({key: tuple(value.shape) for key, value in batch.items()})
-        for i in range(min(cfg.DEMO_NUM_IMAGES, len(batch["images"]))):
+        for i in range(min(5, len(batch["images"]))):
             image = batch["images"][i].permute(1, 2, 0)
             if cfg.NORMALIZATION is not None:
                 mean, std = cfg.NORMALIZATION
                 image = image * torch.tensor(std) + torch.tensor(mean)
             caption = tokenizer.decode(batch["input_ids"][i], skip_special_tokens=True)
-            plt.figure(figsize=cfg.DEMO_FIGURE_SIZE)
+            plt.figure(figsize=(8, 8))
             plt.imshow(image.clamp(0, 1))
-            plt.title(caption, fontsize=cfg.DEMO_TITLE_FONT_SIZE, wrap=True)
+            plt.title(caption, fontsize=10, wrap=True)
             plt.axis("off")
             plt.tight_layout()
             plt.show()
