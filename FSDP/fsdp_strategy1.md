@@ -1,3 +1,5 @@
+> Tài liệu thiết kế ban đầu. Engine, distributed checkpoint và logging hiện đã được triển khai; xem mục 5–7 trong [README](../README.md) cho hành vi hiện tại.
+
 # Stage 1 FSDP: tiến độ hiện tại và công việc cần làm
 
 Cập nhật 2026-10-07. Tài liệu hợp nhất quyết định, tiến độ và kế hoạch FSDP/ZeRO-3; thay thế bản thiết kế sharded queue trước đây.
